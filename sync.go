@@ -7,11 +7,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"gosuda.org/gstime/assurance"
 	"gosuda.org/gstime/clock"
 	"gosuda.org/gstime/config"
 	"gosuda.org/gstime/core"
@@ -63,6 +66,7 @@ type SyncEngine struct {
 	pollIntvl    time.Duration
 	queryTimeout time.Duration
 
+	pollMu  sync.Mutex
 	mu      sync.Mutex
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
@@ -168,6 +172,13 @@ func (e *SyncEngine) loop(ctx context.Context) {
 
 // PollOnce executes a single parallel query round across configured sources and publishes consensus.
 func (e *SyncEngine) PollOnce(ctx context.Context) error {
+	e.pollMu.Lock()
+	defer e.pollMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	startReading := e.svc.rawClock.Read()
+	scaleLow, scaleUpp := e.svc.rawClock.ScaleEnvelope()
 	if e.closed.Load() {
 		return errors.New("sync engine is closed")
 	}
@@ -197,15 +208,52 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 	wg.Wait()
 	close(results)
 
-	var intervals []core.TimeInterval
-	seenDomains := make(map[string]bool)
-
+	// Every interval must refer to this same reading, not to its individual RawMid.
+	reading := e.svc.rawClock.Read()
+	nowRaw := reading.Raw
+	currentLow, currentUpp := e.svc.rawClock.ScaleEnvelope()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if reading.ContinuityToken != startReading.ContinuityToken || reading.BackendGeneration != startReading.BackendGeneration || nowRaw < startReading.Raw || currentLow != scaleLow || currentUpp != scaleUpp {
+		return errors.New("raw clock changed during query round")
+	}
+	maxAge := e.cfg.Assurance.MaxAgeNs
+	if maxAge <= 0 {
+		maxAge = 10 * 1_000_000_000
+	}
+	if uint64(nowRaw) > math.MaxUint64-uint64(maxAge) {
+		return core.ErrOverflow
+	}
+	byDomain := make(map[string][]core.TimeInterval)
 	for r := range results {
-		if r.err == nil && r.res != nil {
-			if !seenDomains[r.domain] {
-				seenDomains[r.domain] = true
-				intervals = append(intervals, r.res.HardInterval)
-			}
+		if r.err != nil || r.res == nil || r.domain == "" {
+			continue
+		}
+		if r.res.RawMid > nowRaw || nowRaw-r.res.RawMid > core.RawNanos(maxAge) {
+			continue
+		}
+		sample := &assurance.AssuranceAnchor{
+			RawAnchor: r.res.RawMid, LowerAtAnchor: r.res.HardInterval.Earliest, UpperAtAnchor: r.res.HardInterval.Latest,
+			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: startReading.ReadBound,
+			ContinuityToken: reading.ContinuityToken, ValidUntilRaw: nowRaw,
+		}
+		inv, err := assurance.PropagateAnchor(sample, nowRaw, reading.ReadBound, reading.ContinuityToken, 0, 0, e.cfg.Assurance.MaxWidthNs)
+		if err != nil {
+			continue
+		}
+		byDomain[r.domain] = append(byDomain[r.domain], *inv)
+	}
+	var domains []string
+	for domain := range byDomain {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	var intervals []core.TimeInterval
+	for _, domain := range domains {
+		consolidated := source.ConsolidateDomainIntervals(core.FaultDomainID(domain), byDomain[domain])
+		if !consolidated.Inconsistent {
+			intervals = append(intervals, consolidated.Interval)
 		}
 	}
 
@@ -214,8 +262,8 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		minDomains = 1
 	}
 
-	if len(seenDomains) < minDomains {
-		return fmt.Errorf("insufficient voting domains: got %d, required %d", len(seenDomains), minDomains)
+	if len(intervals) < minDomains {
+		return fmt.Errorf("insufficient voting domains: got %d, required %d", len(intervals), minDomains)
 	}
 
 	faultBudget := e.cfg.Assurance.FaultBudget
@@ -236,23 +284,18 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		return fmt.Errorf("consensus computation failed: %w", err)
 	}
 
-	reading := e.svc.rawClock.Read()
-	nowRaw := reading.Raw
-	center := (consensus.Hull.Earliest + consensus.Hull.Latest) / 2
-
-	maxAge := e.cfg.Assurance.MaxAgeNs
-	if maxAge <= 0 {
-		maxAge = 10 * 1_000_000_000
-	}
+	center := consensus.Hull.Earliest + (consensus.Hull.Latest-consensus.Hull.Earliest)/2
 	validUntilRaw := nowRaw + core.RawNanos(maxAge)
 
-	_ = e.svc.InitializeEstimate(nowRaw, center, 0)
+	if err := e.svc.InitializeEstimate(nowRaw, center, 0); err != nil {
+		return err
+	}
 
 	err = e.svc.PublishAssuranceRound(
 		nowRaw,
 		consensus.Hull,
 		uint32(faultBudget),
-		uint32(len(seenDomains)),
+		uint32(len(intervals)),
 		uint32(minHonest),
 		uint32(len(consensus.Components)),
 		validUntilRaw,

@@ -3,6 +3,7 @@ package assurance
 import (
 	"crypto/rand"
 	"errors"
+	"math"
 	"sync"
 
 	"gosuda.org/gstime/core"
@@ -73,8 +74,17 @@ func PropagateAnchor(
 		return nil, ErrContinuityTokenMismatch
 	}
 
+	if anchor.RawScaleLower <= 0 || anchor.RawScaleUpper < anchor.RawScaleLower {
+		return nil, core.ErrInvalidRange
+	}
 	dr := r - anchor.RawAnchor
+	if uint64(anchor.RawReadBound) > math.MaxUint64-uint64(currentRawReadBound) {
+		return nil, core.ErrOverflow
+	}
 	rawDeltaError := uint64(anchor.RawReadBound) + uint64(currentRawReadBound)
+	if uint64(dr) > math.MaxInt64 || rawDeltaError > uint64(math.MaxInt64)-uint64(dr) {
+		return nil, core.ErrOverflow
+	}
 
 	var drLo uint64
 	if uint64(dr) > rawDeltaError {
@@ -91,13 +101,22 @@ func PropagateAnchor(
 		return nil, err
 	}
 
-	L := anchor.LowerAtAnchor + core.GstInstant(advanceLo) + core.GstInstant(lowerDebt)
-	U := anchor.UpperAtAnchor + core.GstInstant(advanceHi) + core.GstInstant(upperDebt)
+	L, err := checkedInstantAdd(anchor.LowerAtAnchor, advanceLo, int64(lowerDebt))
+	if err != nil {
+		return nil, err
+	}
+	U, err := checkedInstantAdd(anchor.UpperAtAnchor, advanceHi, int64(upperDebt))
+	if err != nil {
+		return nil, err
+	}
 
 	if L > U {
 		return nil, core.ErrInvalidRange
 	}
 
+	if L < 0 && U > core.GstInstant(math.MaxInt64)+L {
+		return nil, core.ErrOverflow
+	}
 	width := int64(U - L)
 	if maxAssuranceWidthNs > 0 && width >= maxAssuranceWidthNs {
 		return nil, ErrBoundTooWide
@@ -107,6 +126,17 @@ func PropagateAnchor(
 		Earliest: L,
 		Latest:   U,
 	}, nil
+}
+
+func checkedInstantAdd(base core.GstInstant, terms ...int64) (core.GstInstant, error) {
+	v := int64(base)
+	for _, d := range terms {
+		if (d > 0 && v > math.MaxInt64-d) || (d < 0 && v < math.MinInt64-d) {
+			return 0, core.ErrOverflow
+		}
+		v += d
+	}
+	return core.GstInstant(v), nil
 }
 
 // AssuranceClock manages the synchronization state machine and certified bounds.
