@@ -43,6 +43,7 @@ type MeasurementResult struct {
 	DeltaRaw          int64 // round trip delay before clamp
 	DeltaClamped      int64 // round trip delay clamped to precision floor
 	RawMid            core.RawNanos
+	RawReadBound      core.ErrorNs
 	Center            core.GstInstant
 	NetworkBound      int64
 	HardInterval      core.TimeInterval
@@ -84,6 +85,10 @@ func ComputeMeasurement(in MeasurementInput) (*MeasurementResult, error) {
 	}
 
 	rawMid := in.LocalSendRaw + (in.LocalRecvRaw-in.LocalSendRaw)/2
+	rawReadBound := in.LocalSendReadError
+	if in.LocalRecvReadError > rawReadBound {
+		rawReadBound = in.LocalRecvReadError
+	}
 	center := in.LocalEstimateAtMid + core.GstInstant(theta)
 
 	netBound := in.ServerRootDispersionNs +
@@ -110,6 +115,7 @@ func ComputeMeasurement(in MeasurementInput) (*MeasurementResult, error) {
 		DeltaRaw:          deltaRaw,
 		DeltaClamped:      deltaClamped,
 		RawMid:            rawMid,
+		RawReadBound:      rawReadBound,
 		Center:            center,
 		NetworkBound:      netBound,
 		HardInterval:      hardInterval,

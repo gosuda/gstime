@@ -245,7 +245,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 		}
 		sample := &assurance.AssuranceAnchor{
 			RawAnchor: r.res.RawMid, LowerAtAnchor: r.res.HardInterval.Earliest, UpperAtAnchor: r.res.HardInterval.Latest,
-			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: startReading.ReadBound,
+			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: r.res.RawReadBound,
 			ContinuityToken: reading.ContinuityToken, ValidUntilRaw: nowRaw,
 		}
 		inv, err := assurance.PropagateAnchor(sample, nowRaw, reading.ReadBound, reading.ContinuityToken, 0, 0, e.cfg.Assurance.MaxWidthNs)
