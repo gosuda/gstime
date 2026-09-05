@@ -28,3 +28,19 @@ func TestPropagateAnchorRejectsOverflow(t *testing.T) {
 		})
 	}
 }
+
+func TestNewScaleDoesNotReuseOldPropagation(t *testing.T) {
+	ac := assurance.NewAssuranceClock(32_000_000_000)
+	_, err := ac.ProcessFullRound(1_000_000_000, core.TimeInterval{Earliest: 99_999_000_000, Latest: 100_001_000_000}, 100, core.RateScale(core.OneQ48), core.RateScale(core.OneQ48), 1, 20_000_000_000, 1, 3, 2, 1, [32]byte{}, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	interval, err := ac.ProcessFullRound(2_000_000_000, core.TimeInterval{Earliest: 100_500_000_000, Latest: 102_500_000_000}, 100, core.RateScale(2*core.OneQ48), core.RateScale(2*core.OneQ48), 1, 20_000_000_000, 1, 3, 2, 1, [32]byte{}, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const truth = 102_000_000_000
+	if interval.Earliest > truth || interval.Latest < truth {
+		t.Fatalf("new scale reused stale propagation: %+v excludes %d", interval, truth)
+	}
+}

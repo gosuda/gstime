@@ -88,20 +88,12 @@ func BuildProtectedRequest(
 	cipherLen := len(plaintext) + aead.Overhead()
 	rawBodyLen := 2 + 2 + len(nonce) + cipherLen
 	pad := (4 - (rawBodyLen % 4)) % 4
-	totalAuthFieldLen := 4 + rawBodyLen + pad
 
 	// Build Associated Data (AD):
-	// NTP header (48 bytes) || Encoded Pre-Auth Fields || Type(0x0404) || FieldLen || NonceLen || CipherLen
+	// RFC 8915 section 5.6: NTP header || extension fields BEFORE Authenticator.
 	var ad []byte
 	ad = append(ad, ntpHeader...)
 	ad = append(ad, encodedPreAuth...)
-
-	authPrefix := make([]byte, 8)
-	binary.BigEndian.PutUint16(authPrefix[0:2], ExtTypeAuthenticator)
-	binary.BigEndian.PutUint16(authPrefix[2:4], uint16(totalAuthFieldLen))
-	binary.BigEndian.PutUint16(authPrefix[4:6], uint16(len(nonce)))
-	binary.BigEndian.PutUint16(authPrefix[6:8], uint16(cipherLen))
-	ad = append(ad, authPrefix...)
 
 	ciphertext := aead.Seal(nil, nonce, plaintext, ad)
 
@@ -174,14 +166,13 @@ func VerifyAndDecryptResponse(
 	ciphertext := authWire[8+nonceLen : 8+nonceLen+cipherLen]
 
 	// 4. Construct Associated Data:
-	// NTP header (48 bytes) || Encoded Pre-Auth Fields || Authenticator 8-byte prefix
+	// RFC 8915 section 5.6: NTP header || extension fields BEFORE Authenticator.
 	preAuthFields := extFields[:len(extFields)-1]
 	encodedPreAuth := ntp.EncodeExtensionFields(preAuthFields)
 
 	var ad []byte
 	ad = append(ad, ntpHeader...)
 	ad = append(ad, encodedPreAuth...)
-	ad = append(ad, authWire[:8]...) // Type, Length, NonceLen, CipherLen
 
 	plaintext, err := aead.Open(nil, nonce, ciphertext, ad)
 	if err != nil {

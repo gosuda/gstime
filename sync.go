@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +24,11 @@ import (
 	"gosuda.org/gstime/source"
 )
 
-// SourceQuerier abstracts network interactions for NTP/NTS queries, enabling unit testing without external network.
+// SourceQuerier abstracts network interactions for NTP/NTS queries.
+// Implementations must acquire fresh evidence during this round, on the supplied
+// service raw clock and its current continuity/scale envelope. Cached results
+// from an earlier round or clock generation must not be returned. HardInterval
+// describes GST time at RawMid, not at query completion.
 type SourceQuerier interface {
 	QuerySource(ctx context.Context, src config.SourceConfig, rawNow core.RawNanos) (*ntp.MeasurementResult, error)
 }
@@ -171,12 +176,17 @@ func (e *SyncEngine) loop(ctx context.Context) {
 }
 
 // PollOnce executes a single parallel query round across configured sources and publishes consensus.
-func (e *SyncEngine) PollOnce(ctx context.Context) error {
+func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	e.pollMu.Lock()
 	defer e.pollMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer func() {
+		if pollErr != nil {
+			pollErr = errors.Join(pollErr, e.svc.markRoundFailure(e.cfg.Assurance.MaxHoldoverAgeNs))
+		}
+	}()
 	startReading := e.svc.rawClock.Read()
 	scaleLow, scaleUpp := e.svc.rawClock.ScaleEnvelope()
 	if e.closed.Load() {
@@ -230,7 +240,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		if r.err != nil || r.res == nil || r.domain == "" {
 			continue
 		}
-		if r.res.RawMid > nowRaw || nowRaw-r.res.RawMid > core.RawNanos(maxAge) {
+		if r.res.RawMid < startReading.Raw || r.res.RawMid > nowRaw || nowRaw-r.res.RawMid > core.RawNanos(maxAge) {
 			continue
 		}
 		sample := &assurance.AssuranceAnchor{
@@ -284,22 +294,8 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		return fmt.Errorf("consensus computation failed: %w", err)
 	}
 
-	center := consensus.Hull.Earliest + (consensus.Hull.Latest-consensus.Hull.Earliest)/2
 	validUntilRaw := nowRaw + core.RawNanos(maxAge)
-
-	if err := e.svc.InitializeEstimate(nowRaw, center, 0); err != nil {
-		return err
-	}
-
-	err = e.svc.PublishAssuranceRound(
-		nowRaw,
-		consensus.Hull,
-		uint32(faultBudget),
-		uint32(len(intervals)),
-		uint32(minHonest),
-		uint32(len(consensus.Components)),
-		validUntilRaw,
-	)
+	err = e.svc.publishSyncRound(reading, scaleLow, scaleUpp, consensus, validUntilRaw)
 	if err != nil {
 		return fmt.Errorf("failed to publish assurance round: %w", err)
 	}
@@ -317,11 +313,12 @@ type defaultSourceQuerier struct {
 }
 
 type ntsSession struct {
-	c2sKey  []byte
-	s2cKey  []byte
-	c2sAead cipher.AEAD
-	s2cAead cipher.AEAD
-	jar     *nts.CookieJar
+	udpEndpoint string
+	c2sKey      []byte
+	s2cKey      []byte
+	c2sAead     cipher.AEAD
+	s2cAead     cipher.AEAD
+	jar         *nts.CookieJar
 }
 
 func newDefaultSourceQuerier(rc clock.RawClock, ec *clock.EstimateClock, lh *core.LeapHistory, timeout time.Duration) *defaultSourceQuerier {
@@ -435,9 +432,7 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	}
 
 	d := net.Dialer{Timeout: q.timeout}
-	host, _, _ := net.SplitHostPort(src.Endpoint)
-	host = cmp.Or(host, src.Endpoint)
-	udpEndpoint := net.JoinHostPort(host, "123")
+	udpEndpoint := sess.udpEndpoint
 
 	conn, err := d.DialContext(ctx, "udp", udpEndpoint)
 	if err != nil {
@@ -616,85 +611,59 @@ func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint stri
 	host, port, _ := net.SplitHostPort(endpoint)
 	host = cmp.Or(host, endpoint)
 	port = cmp.Or(port, "4460")
-	keAddr := net.JoinHostPort(host, port)
-
-	dialer := &net.Dialer{Timeout: q.timeout}
-	tlsConfig := &tls.Config{
-		NextProtos: []string{"ntske/1"},
-		ServerName: host,
+	timeout := q.timeout
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
 	}
-
-	conn, err := tls.DialWithDialer(dialer, "tcp", keAddr, tlsConfig)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: timeout}, Config: &tls.Config{
+		MinVersion: tls.VersionTLS13, NextProtos: []string{"ntske/1"}, ServerName: host,
+	}}
+	connection, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
+	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(q.timeout))
+		_ = connection.SetDeadline(deadline)
 	}
-
-	req := nts.BuildClientRequest([]uint16{15, 30}, true)
-	if _, err := conn.Write(req); err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 8192)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	records, err := nts.ParseRecords(buf[:n], 16*1024)
-	if err != nil {
-		return nil, err
-	}
-
-	var cookies [][]byte
-	var aeadID uint16 = 15
-
-	for _, rec := range records {
-		switch rec.Type {
-		case 3:
-			if len(rec.Body) > 0 {
-				cookies = append(cookies, rec.Body)
-			}
-		case 4:
-			if len(rec.Body) >= 2 {
-				aeadID = uint16(rec.Body[0])<<8 | uint16(rec.Body[1])
-			}
-		}
-	}
-
-	if len(cookies) == 0 {
-		return nil, errors.New("no NTS cookies returned by server")
-	}
-
+	conn := connection.(*tls.Conn)
 	cs := conn.ConnectionState()
-	c2sKey, s2cKey, err := nts.ExportDirectionalKeys(cs.ExportKeyingMaterial, 0, aeadID)
+	if cs.NegotiatedProtocol != "ntske/1" {
+		return nil, errors.New("NTS-KE ALPN was not negotiated")
+	}
+	offered := []uint16{15, 30}
+	if _, err := conn.Write(nts.BuildClientRequest(offered, true)); err != nil {
+		return nil, err
+	}
+	response, err := nts.ReadServerResponse(conn, offered)
+	if err != nil {
+		return nil, err
+	}
+	c2sKey, s2cKey, err := nts.ExportDirectionalKeys(cs.ExportKeyingMaterial, 0, response.AEAD)
 	if err != nil {
 		return nil, fmt.Errorf("failed to export NTS directional keys: %w", err)
 	}
-
-	c2sAead, err := nts.NewAEAD(aeadID, c2sKey)
+	c2sAead, err := nts.NewAEAD(response.AEAD, c2sKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct C2S AEAD: %w", err)
+		return nil, err
 	}
-	s2cAead, err := nts.NewAEAD(aeadID, s2cKey)
+	s2cAead, err := nts.NewAEAD(response.AEAD, s2cKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct S2C AEAD: %w", err)
+		return nil, err
 	}
-
+	udpHost := response.ServerName
+	if udpHost == "" {
+		udpHost, _, err = net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			return nil, err
+		}
+	}
 	jar := nts.NewCookieJar()
-	jar.AddCookies(cookies)
-
-	return &ntsSession{
-		c2sKey:  c2sKey,
-		s2cKey:  s2cKey,
-		c2sAead: c2sAead,
-		s2cAead: s2cAead,
-		jar:     jar,
-	}, nil
+	jar.AddCookies(response.Cookies)
+	return &ntsSession{c2sKey: c2sKey, s2cKey: s2cKey, c2sAead: c2sAead, s2cAead: s2cAead, jar: jar,
+		udpEndpoint: net.JoinHostPort(udpHost, strconv.Itoa(int(response.Port)))}, nil
 }

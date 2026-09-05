@@ -142,6 +142,9 @@ func (c *SystemRawClock) ScaleEnvelope() (core.RateScale, core.RateScale) {
 	return low, upp
 }
 
+// IncludesSuspend is false because time.Since does not guarantee that elapsed
+// monotonic time includes sleep on every supported OS. The fixed rate envelope
+// is an operator assumption, not a hardware measurement or suspend detector.
 func (c *SystemRawClock) IncludesSuspend() bool {
-	return true
+	return false
 }

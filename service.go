@@ -4,16 +4,19 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"gosuda.org/gstime/assurance"
 	"gosuda.org/gstime/clock"
 	"gosuda.org/gstime/core"
 	"gosuda.org/gstime/publish"
+	"gosuda.org/gstime/source"
 )
 
 // ClockService coordinates acquisition, discipline, and assurance publishing (Section 1.3).
 type ClockService struct {
+	writerMu       sync.Mutex
 	rawClock       clock.RawClock
 	estimateClock  *clock.EstimateClock
 	assuranceClock *assurance.AssuranceClock
@@ -31,6 +34,7 @@ func NewClockService(
 	cfgID [32]byte,
 	maxAssuranceWidthNs int64,
 ) *ClockService {
+	raw = clock.NewContinuityGuard(raw)
 	scaleLow, scaleUpp := raw.ScaleEnvelope()
 	estClk := clock.NewEstimateClock()
 	assClk := assurance.NewAssuranceClock(maxAssuranceWidthNs)
@@ -64,21 +68,13 @@ func NewClockService(
 
 // Now performs a single raw clock read and evaluates the assured snapshot (Section 7.2).
 func (s *ClockService) Now() AssuredNow {
-	reading := s.rawClock.Read()
 	snap := s.publisher.Acquire()
+	reading := s.rawClock.Read()
 
 	est, _ := snap.EstimateMapping.Evaluate(reading.Raw)
 
 	if snap.Assurance.Status == StatusSynced || snap.Assurance.Status == StatusHoldover {
-		inv, err := assurance.PropagateAnchor(
-			snap.Assurance.Anchor,
-			reading.Raw,
-			reading.ReadBound,
-			reading.ContinuityToken,
-			snap.Assurance.LowerDebt,
-			snap.Assurance.UpperDebt,
-			snap.Assurance.MaxAssuranceWidthNs,
-		)
+		inv, err := s.propagateSnapshot(snap, reading)
 
 		if err == nil {
 			d1 := math.Abs(float64(est - inv.Earliest))
@@ -165,22 +161,14 @@ func (s *ClockService) NowUnixProjection() (UnixProjection, error) {
 
 // NowPublicAssured returns the public clock's assured presentation view (Section 7.8).
 func (s *ClockService) NowPublicAssured() PublicAssuredNow {
-	reading := s.rawClock.Read()
 	snap := s.publisher.Acquire()
+	reading := s.rawClock.Read()
 
 	est, _ := snap.EstimateMapping.Evaluate(reading.Raw)
 	pCenter, _ := s.publicClock.ReadPublicInstant(est, reading.Raw)
 
 	if snap.Assurance.Status == StatusSynced || snap.Assurance.Status == StatusHoldover {
-		inv, err := assurance.PropagateAnchor(
-			snap.Assurance.Anchor,
-			reading.Raw,
-			reading.ReadBound,
-			reading.ContinuityToken,
-			snap.Assurance.LowerDebt,
-			snap.Assurance.UpperDebt,
-			snap.Assurance.MaxAssuranceWidthNs,
-		)
+		inv, err := s.propagateSnapshot(snap, reading)
 
 		if err == nil {
 			pubEps := clock.ComputePublicSymmetricEpsilon(pCenter, inv, reading.ReadBound)
@@ -219,6 +207,35 @@ func (s *ClockService) NowPublicAssured() PublicAssuredNow {
 		Status:                 snap.Assurance.Status,
 		Reason:                 snap.Assurance.Reason,
 	}
+}
+
+func (s *ClockService) propagateSnapshot(snap *publish.Snapshot, reading clock.RawReading) (*core.TimeInterval, error) {
+	low, upp := s.rawClock.ScaleEnvelope()
+	if snap.Assurance.Anchor != nil && (low != snap.Assurance.Anchor.RawScaleLower || upp != snap.Assurance.Anchor.RawScaleUpper) {
+		return nil, assurance.ErrContinuityTokenMismatch
+	}
+	return assurance.PropagateAnchor(snap.Assurance.Anchor, reading.Raw, reading.ReadBound,
+		reading.ContinuityToken, snap.Assurance.LowerDebt, snap.Assurance.UpperDebt, snap.Assurance.MaxAssuranceWidthNs)
+}
+
+func (s *ClockService) markRoundFailure(maxHoldoverAge int64) error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	snap := s.publisher.Acquire()
+	if snap.Assurance.Status == StatusUnanchored || snap.Assurance.Status == StatusDesync {
+		return nil
+	}
+	if _, err := s.propagateSnapshot(snap, s.rawClock.Read()); err != nil {
+		s.assuranceClock.TransitionToDesync(mapPropagationError(err))
+	} else {
+		s.assuranceClock.BeginHoldover(core.ReasonInsufficientDomains, core.RawNanos(maxHoldoverAge))
+		r := s.rawClock.Read()
+		_, status, reason, _ := s.assuranceClock.EvaluateAt(r.Raw, r.ReadBound, r.ContinuityToken)
+		if status == StatusDesync {
+			s.assuranceClock.TransitionToDesync(reason)
+		}
+	}
+	return s.publishCurrent()
 }
 
 func mapPropagationError(err error) StatusReason {
@@ -296,6 +313,9 @@ func (s *ClockService) PastWatermark(
 		return 0, snap.Assurance.Status, ErrDesynchronized
 	}
 
+	if _, err := s.propagateSnapshot(snap, s.rawClock.Read()); err != nil {
+		return 0, StatusDesync, ErrDesynchronized
+	}
 	return snap.Assurance.PastWatermark, snap.Assurance.Status, nil
 }
 
@@ -387,6 +407,31 @@ func (s *ClockService) WaitSync(ctx context.Context) error {
 	}
 }
 
+// publishSyncRound preserves the query round's reference reading through the
+// writer transaction. A discontinuity between selection and publication cannot
+// relabel old evidence with the new clock's continuity token or scale.
+func (s *ClockService) publishSyncRound(selection clock.RawReading, low, upp core.RateScale,
+	consensus *source.AssuranceConsensusResult, validUntil RawNanos) error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	current := s.rawClock.Read()
+	currentLow, currentUpp := s.rawClock.ScaleEnvelope()
+	if current.Raw < selection.Raw || current.ContinuityToken != selection.ContinuityToken ||
+		current.BackendGeneration != selection.BackendGeneration || currentLow != low || currentUpp != upp {
+		s.assuranceClock.TransitionToDesync(ReasonRawDiscontinuity)
+		return errors.Join(assurance.ErrContinuityTokenMismatch, s.publishCurrent())
+	}
+	_, err := s.assuranceClock.ProcessFullRound(selection.Raw, consensus.Hull, selection.ReadBound,
+		low, upp, selection.ContinuityToken, validUntil, uint32(consensus.FaultBudget), uint32(consensus.EligibleDomains),
+		uint32(consensus.ThresholdK), uint32(len(consensus.Components)), s.leapHistory.ID, s.configID)
+	if err != nil {
+		return errors.Join(err, s.publishCurrent())
+	}
+	center := consensus.Hull.Earliest + (consensus.Hull.Latest-consensus.Hull.Earliest)/2
+	s.estimateClock.InitializeAnchors(selection.Raw, center, 0)
+	return s.publishCurrent()
+}
+
 // PublishAssuranceRound updates internal state and publishes a new snapshot.
 func (s *ClockService) PublishAssuranceRound(
 	rSel RawNanos,
@@ -397,6 +442,8 @@ func (s *ClockService) PublishAssuranceRound(
 	componentCount uint32,
 	validUntilRaw RawNanos,
 ) error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	reading := s.rawClock.Read()
 	scaleLow, scaleUpp := s.rawClock.ScaleEnvelope()
 
@@ -426,10 +473,25 @@ func (s *ClockService) PublishAssuranceRound(
 
 // InitializeEstimate anchors the estimate clock.
 func (s *ClockService) InitializeEstimate(raw0 RawNanos, target GstInstant, baseRate RateFrac) error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	s.estimateClock.InitializeAnchors(raw0, target, baseRate)
 	return s.publishCurrent()
 }
 
+// Invalidate discards active assurance after an externally reported clock event.
+// Stop outstanding synchronization work before calling it after resume/restore;
+// only a new trusted round may restore SYNCED. Full-memory rollback recovery
+// requires a fresh process or an external monotonic epoch, not this local guard.
+func (s *ClockService) Invalidate() error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.assuranceClock.TransitionToDesync(ReasonRawDiscontinuity)
+	return s.publishCurrent()
+}
+
+// publishCurrent is called with writerMu held, making generation allocation and
+// state capture one serialized writer transaction. Readers retain atomic snapshots.
 func (s *ClockService) publishCurrent() error {
 	reading := s.rawClock.Read()
 	scaleLow, scaleUpp := s.rawClock.ScaleEnvelope()

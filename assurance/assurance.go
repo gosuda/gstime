@@ -198,7 +198,9 @@ func (ac *AssuranceClock) ProcessFullRound(
 		if ac.state.Anchor != nil &&
 			ac.state.Anchor.LeapHistoryID == leapHistoryID &&
 			ac.state.Anchor.ConfigID == configID &&
-			ac.state.Anchor.ContinuityToken == continuityToken {
+			ac.state.Anchor.ContinuityToken == continuityToken &&
+			ac.state.Anchor.RawScaleLower == scaleLower &&
+			ac.state.Anchor.RawScaleUpper == scaleUpper {
 
 			oldPropagated, err := PropagateAnchor(
 				ac.state.Anchor,
@@ -275,14 +277,28 @@ func (ac *AssuranceClock) ProcessFullRound(
 
 // TransitionToHoldover marks the transition from SYNCED to HOLDOVER when round unavailable.
 func (ac *AssuranceClock) TransitionToHoldover(reason core.StatusReason) {
+	ac.BeginHoldover(reason, 0)
+}
+
+// BeginHoldover limits continued use from the last successful selection, never
+// from a repeated failure. A cap may shorten, but never extend, anchor validity.
+func (ac *AssuranceClock) BeginHoldover(reason core.StatusReason, maxAge core.RawNanos) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
-
-	if ac.state.Status == core.StatusSynced {
-		ac.state.Status = core.StatusHoldover
-		ac.state.Reason = reason
-		ac.state.Generation++
+	if ac.state.Status != core.StatusSynced && ac.state.Status != core.StatusHoldover {
+		return
 	}
+	if maxAge > 0 && uint64(ac.state.LastSuccessfulRoundRaw) <= math.MaxUint64-uint64(maxAge) {
+		limit := ac.state.LastSuccessfulRoundRaw + maxAge
+		if ac.state.Anchor != nil && limit < ac.state.Anchor.ValidUntilRaw {
+			anchor := *ac.state.Anchor // published snapshots must remain immutable
+			anchor.ValidUntilRaw = limit
+			ac.state.Anchor = &anchor
+		}
+	}
+	ac.state.Status = core.StatusHoldover
+	ac.state.Reason = reason
+	ac.state.Generation++
 }
 
 // TransitionToDesync marks unrecoverable fault or cap expiration.

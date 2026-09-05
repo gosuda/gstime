@@ -40,7 +40,7 @@ func TestRegressionPollOnceMustNormalizeSampleTimes(t *testing.T) {
 		{"post_sample_delay", 1_000_000_000, 100_000_000,
 			[]core.RawNanos{1_000_000_000, 1_000_000_000, 1_000_000_000},
 			[]core.GstInstant{100_000_000_000, 100_000_000_000, 100_000_000_000}, 100_100_000_000},
-		{"different_midpoints", 1_100_000_000, 0,
+		{"different_midpoints", 1_000_000_000, 100_000_000,
 			[]core.RawNanos{1_000_000_000, 1_050_000_000, 1_100_000_000},
 			[]core.GstInstant{100_000_000_000, 100_050_000_000, 100_100_000_000}, 100_100_000_000},
 	} {
@@ -83,5 +83,26 @@ func TestRegressionPollOnceMustNormalizeSampleTimes(t *testing.T) {
 				t.Fatal("certified interval excludes true time at selection")
 			}
 		})
+	}
+}
+
+func TestPollRejectsCachedSampleFromBeforeRound(t *testing.T) {
+	raw := clock.NewSimulatedRawClock(1_000_000_000)
+	lh, _ := core.NewLeapHistory(10, nil)
+	cfg := config.DefaultConfig()
+	cfg.Sources = []config.SourceConfig{{FaultDomainID: "a", Endpoint: "a"}, {FaultDomainID: "b", Endpoint: "b"}, {FaultDomainID: "c", Endpoint: "c"}}
+	id, _ := cfg.ConfigID()
+	svc := gstime.NewClockService(raw, lh, id, cfg.Assurance.MaxWidthNs)
+	q := &regressionReferenceQuerier{raw: raw, measurements: map[string]*ntp.MeasurementResult{}}
+	for _, src := range cfg.Sources {
+		q.measurements[src.Endpoint] = &ntp.MeasurementResult{RawMid: 999_000_000, HardInterval: core.TimeInterval{Earliest: 99_999_000_000, Latest: 100_001_000_000}}
+	}
+	e, err := gstime.NewSyncEngine(cfg, svc, gstime.WithSourceQuerier(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err = e.PollOnce(context.Background()); err == nil {
+		t.Fatal("cached evidence without a continuity identity was accepted")
 	}
 }
