@@ -40,12 +40,24 @@ cfgID, _ := cfg.ConfigID()
 
 ## Minimal Examples by Use Case
 
-### Service Initialization
+### Service & Background Sync Initialization
 
 ```go
 rawClock := clock.NewSystemRawClock()
 leapHistory, _ := core.NewLeapHistory(10, nil) // Configured GSTL1 leap table
 svc := gstime.NewClockService(rawClock, leapHistory, cfgID, 32_000_000_000)
+
+// Start background NTP/NTS synchronization engine
+engine, err := gstime.NewSyncEngine(cfg, svc)
+if err != nil {
+	log.Fatal(err)
+}
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+_ = engine.Start(ctx)
+defer engine.Close() // Best Practice: Gracefully stops background worker with zero goroutine leaks
 ```
 
 ### 1. PublicClock: Monotonic Presentation Time

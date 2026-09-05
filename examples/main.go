@@ -47,12 +47,24 @@ func main() {
 		panic(err)
 	}
 
-	_, cfgID, err := ExampleConfiguration()
+	cfg, cfgID, err := ExampleConfiguration()
 	if err != nil {
 		panic(err)
 	}
 
 	svc := gstime.NewClockService(rawClock, lh, cfgID, 32_000_000_000)
+
+	// Best Practice: Launch background SyncEngine with context and defer Close()
+	engine, err := gstime.NewSyncEngine(cfg, svc)
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_ = engine.Start(ctx)
+	defer engine.Close() // Guarantees zero goroutine leaks on exit
 
 	nowRaw := rawClock.Read().Raw
 	nowUnixNs := gstime.GstInstant(time.Now().UnixNano())
@@ -80,10 +92,10 @@ func main() {
 	dec, _, _ := svc.After(nowUnixNs - 1_000_000)
 	fmt.Printf("  After(t-1ms): %s\n", dec)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer waitCancel()
 	wm, _, _ := svc.PastWatermark(now.AssuranceEpochID, now.LeapHistoryID, now.ConfigID)
-	err = svc.CommitWait(ctx, wm-1_000, now.AssuranceEpochID, now.LeapHistoryID, now.ConfigID)
+	err = svc.CommitWait(waitCtx, wm-1_000, now.AssuranceEpochID, now.LeapHistoryID, now.ConfigID)
 	fmt.Printf("  CommitWait(commitTs < watermark): err=%v\n\n", err)
 
 	// Use Case 3: Civil UTC with Leap Seconds (secondOfDay: 0..86400)

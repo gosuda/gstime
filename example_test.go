@@ -9,6 +9,7 @@ import (
 	"gosuda.org/gstime/clock"
 	"gosuda.org/gstime/config"
 	"gosuda.org/gstime/core"
+	"gosuda.org/gstime/ntp"
 )
 
 func newTestService(rawNow core.RawNanos, target gstime.GstInstant) *gstime.ClockService {
@@ -134,4 +135,51 @@ func Example_vmMigrationLockDetection() {
 	fmt.Printf("AfterVMSuspend: %s, Reason: %s\n", now.Status, now.Reason)
 	// Output:
 	// AfterVMSuspend: DESYNC, Reason: BOUND_TOO_OLD
+}
+
+// Example_syncEngineBackgroundPolling demonstrates background NTP polling with leak-free lifecycle management.
+func Example_syncEngineBackgroundPolling() {
+	raw := clock.NewSimulatedRawClock(10_000_000_000)
+	lh, _ := core.NewLeapHistory(10, nil)
+	var cfgID [32]byte
+
+	cfg := config.DefaultConfig()
+	cfg.Sources = []config.SourceConfig{
+		{FaultDomainID: "cloudflare", Endpoint: "time.cloudflare.com:123", NTS: false},
+		{FaultDomainID: "google", Endpoint: "time.google.com:123", NTS: false},
+		{FaultDomainID: "apple", Endpoint: "time.apple.com:123", NTS: false},
+	}
+
+	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+
+	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
+	mock := &mockQuerier{
+		results: map[string]*ntp.MeasurementResult{
+			"time.cloudflare.com:123": newMockMeasurement(targetTime, 10_000_000, 10_000_000_000),
+			"time.google.com:123":     newMockMeasurement(targetTime, 12_000_000, 10_000_000_000),
+			"time.apple.com:123":      newMockMeasurement(targetTime, 15_000_000, 10_000_000_000),
+		},
+	}
+
+	engine, err := gstime.NewSyncEngine(cfg, svc, gstime.WithSourceQuerier(mock))
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Perform initial synchronization poll
+	_ = engine.PollOnce(ctx)
+
+	// Start background polling daemon
+	_ = engine.Start(ctx)
+
+	// Best Practice: Always defer engine.Close() to stop polling goroutine and prevent goroutine leaks
+	defer engine.Close()
+
+	now := svc.Now()
+	fmt.Printf("EngineRunning: true, Status: %s\n", now.Status)
+	// Output:
+	// EngineRunning: true, Status: SYNCED
 }
