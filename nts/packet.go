@@ -18,12 +18,12 @@ const (
 )
 
 var (
-	ErrAuthFailed          = errors.New("nts authentication verification failed")
-	ErrMissingUniqueID     = errors.New("nts response missing unique identifier extension field")
-	ErrUniqueIDMismatch    = errors.New("nts response unique identifier mismatch")
-	ErrMissingAuthenticator= errors.New("nts response missing authenticator field")
-	ErrAuthNotLast         = errors.New("nts authenticator is not the last extension field")
-	ErrCookieStarvation    = errors.New("no unused cookies available for request")
+	ErrAuthFailed           = errors.New("nts authentication verification failed")
+	ErrMissingUniqueID      = errors.New("nts response missing unique identifier extension field")
+	ErrUniqueIDMismatch     = errors.New("nts response unique identifier mismatch")
+	ErrMissingAuthenticator = errors.New("nts response missing authenticator field")
+	ErrAuthNotLast          = errors.New("nts authenticator is not the last extension field")
+	ErrCookieStarvation     = errors.New("no unused cookies available for request")
 )
 
 // AuthenticatorField decodes the contents of an RFC 8915 Authenticator extension field.

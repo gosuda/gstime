@@ -14,11 +14,11 @@ var (
 )
 
 const (
-	MaxSamplesPerSource   = 64
-	MinRegressionSamples  = 3
-	DefaultRunsAlpha      = 0.05
-	EstimateQuantumSec    = 1e-9
-	MachineEpsilon        = 2.220446049250313e-16
+	MaxSamplesPerSource  = 64
+	MinRegressionSamples = 3
+	DefaultRunsAlpha     = 0.05
+	EstimateQuantumSec   = 1e-9
+	MachineEpsilon       = 2.220446049250313e-16
 )
 
 // EstimateSample is a single measurement retained by EstimateTrack.

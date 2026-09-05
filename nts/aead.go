@@ -4,7 +4,7 @@ import (
 	"crypto/cipher"
 	"fmt"
 
-	"github.com/secure-io/siv-go"
+	"github.com/gosuda/gstime/internal/siv"
 )
 
 // NewAEAD creates a cipher.AEAD instance for the given registered AEAD ID.

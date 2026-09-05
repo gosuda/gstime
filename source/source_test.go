@@ -16,7 +16,7 @@ func TestWeightedRegressionPlantedPhaseAndRate(t *testing.T) {
 
 	raw0 := core.RawNanos(1_000_000_000)
 	for i := 0; i < 10; i++ {
-		raw := raw0 + core.RawNanos(i*1_000_000_000) // 1 second intervals
+		raw := raw0 + core.RawNanos(i*1_000_000_000)               // 1 second intervals
 		x := float64(int64(raw)-int64(raw0+9*1_000_000_000)) / 1e9 // relative to newest
 		phase := plantedPhase + plantedRate*x
 

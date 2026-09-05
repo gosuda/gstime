@@ -8,7 +8,7 @@ import (
 
 const (
 	HeaderSize        = 48
-	NtpToUnixOffset   = int64(2208988800) // seconds between 1900-01-01 and 1970-01-01
+	NtpToUnixOffset   = int64(2208988800)       // seconds between 1900-01-01 and 1970-01-01
 	MaxCoarseErrorSec = int64(68 * 365 * 86400) // ~68 years (~2^31 seconds)
 )
 
@@ -137,7 +137,7 @@ func UnfoldNtpSeconds(s32 uint32, coarseUnixSec int64) (int64, error) {
 	var matchingCandidate int64
 	matchCount := 0
 
-	for era := baseEra - 1; era <= baseEra + 1; era++ {
+	for era := baseEra - 1; era <= baseEra+1; era++ {
 		if era < 0 {
 			continue
 		}

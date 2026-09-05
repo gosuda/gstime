@@ -18,14 +18,14 @@ type HealthState struct {
 
 // Metrics tracks runtime counters and gauges (Section 7.18).
 type Metrics struct {
-	mu                  sync.RWMutex
-	NowCallsTotal       atomic.Uint64
-	CommitWaitSuccess   atomic.Uint64
-	CommitWaitFail      atomic.Uint64
-	PublicationGen      atomic.Uint64
-	LastPastWatermark   atomic.Int64
-	LastSymmetricEpsNs  atomic.Uint64
-	Health              HealthState
+	mu                 sync.RWMutex
+	NowCallsTotal      atomic.Uint64
+	CommitWaitSuccess  atomic.Uint64
+	CommitWaitFail     atomic.Uint64
+	PublicationGen     atomic.Uint64
+	LastPastWatermark  atomic.Int64
+	LastSymmetricEpsNs atomic.Uint64
+	Health             HealthState
 }
 
 // GlobalMetrics is the default shared telemetry instance.

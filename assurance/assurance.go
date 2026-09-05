@@ -9,11 +9,11 @@ import (
 )
 
 var (
-	ErrRawEarlierThanAnchor   = errors.New("raw instant earlier than anchor raw")
-	ErrAnchorExpired          = errors.New("assurance anchor validity horizon expired")
+	ErrRawEarlierThanAnchor    = errors.New("raw instant earlier than anchor raw")
+	ErrAnchorExpired           = errors.New("assurance anchor validity horizon expired")
 	ErrContinuityTokenMismatch = errors.New("raw continuity token mismatch without bridge")
-	ErrAssuranceConflict      = errors.New("empty intersection between old propagated bound and new hull")
-	ErrBoundTooWide           = errors.New("assurance interval width exceeds maximum cap")
+	ErrAssuranceConflict       = errors.New("empty intersection between old propagated bound and new hull")
+	ErrBoundTooWide            = errors.New("assurance interval width exceeds maximum cap")
 )
 
 // AssuranceAnchor represents an immutable published absolute anchor (Section 4.15).

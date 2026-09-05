@@ -3,7 +3,6 @@ package ntp
 import (
 	"bytes"
 	"testing"
-
 )
 
 func TestPacketEncodeDecode(t *testing.T) {

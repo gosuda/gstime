@@ -65,9 +65,9 @@ func TestP3_CoverageSetContainsHonestIntersection(t *testing.T) {
 	// 4 domains: 3 honest (contain true time), 1 faulty (disjoint)
 	// N=4, F=1 => k=3
 	intervals := []core.TimeInterval{
-		{Earliest: simulatedTrueTime - 100, Latest: simulatedTrueTime + 100}, // honest 1
-		{Earliest: simulatedTrueTime - 50, Latest: simulatedTrueTime + 150},  // honest 2
-		{Earliest: simulatedTrueTime - 200, Latest: simulatedTrueTime + 50},  // honest 3
+		{Earliest: simulatedTrueTime - 100, Latest: simulatedTrueTime + 100},   // honest 1
+		{Earliest: simulatedTrueTime - 50, Latest: simulatedTrueTime + 150},    // honest 2
+		{Earliest: simulatedTrueTime - 200, Latest: simulatedTrueTime + 50},    // honest 3
 		{Earliest: simulatedTrueTime + 5000, Latest: simulatedTrueTime + 6000}, // faulty
 	}
 
@@ -135,14 +135,14 @@ func TestP5_AssuranceIndependentOfEstimateStatistics(t *testing.T) {
 // P6 AbsolutePropagationContainsSimulatedTrueTime
 func TestP6_AbsolutePropagationContainsSimulatedTrueTime(t *testing.T) {
 	anchor := &assurance.AssuranceAnchor{
-		RawAnchor:         1_000_000_000,
-		LowerAtAnchor:     1_700_000_000 * 1_000_000_000 - 10_000,
-		UpperAtAnchor:     1_700_000_000 * 1_000_000_000 + 10_000,
-		RawScaleLower:     core.RateScale(core.OneQ48 + core.RateFromPpmLower(-50.0)),
-		RawScaleUpper:     core.RateScale(core.OneQ48 + core.RateFromPpmUpper(50.0)),
-		RawReadBound:      10,
-		ContinuityToken:   1,
-		ValidUntilRaw:     100_000_000_000,
+		RawAnchor:       1_000_000_000,
+		LowerAtAnchor:   1_700_000_000*1_000_000_000 - 10_000,
+		UpperAtAnchor:   1_700_000_000*1_000_000_000 + 10_000,
+		RawScaleLower:   core.RateScale(core.OneQ48 + core.RateFromPpmLower(-50.0)),
+		RawScaleUpper:   core.RateScale(core.OneQ48 + core.RateFromPpmUpper(50.0)),
+		RawReadBound:    10,
+		ContinuityToken: 1,
+		ValidUntilRaw:   100_000_000_000,
 	}
 
 	trueTime0 := int64(1_700_000_000 * 1_000_000_000)
@@ -261,7 +261,7 @@ func TestP11_ContinuousLeapAxisNeverRepeats(t *testing.T) {
 	}
 
 	// Check 10,000 consecutive nanoseconds across the positive leap second
-	baseNanos := int64(78796800-1) * 1_000_000_000 + 999_995_000
+	baseNanos := int64(78796800-1)*1_000_000_000 + 999_995_000
 	seenInstants := make(map[core.GstInstant]bool)
 
 	for i := int64(0); i < 10_000; i++ {

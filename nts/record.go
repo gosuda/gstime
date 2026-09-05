@@ -7,24 +7,24 @@ import (
 )
 
 const (
-	RecordEndOfMessage        uint16 = 0
-	RecordNextProtocol        uint16 = 1
-	RecordError               uint16 = 2
-	RecordWarning             uint16 = 3
-	RecordAeadNegotiation     uint16 = 4
-	RecordNewCookie           uint16 = 5
-	RecordServerNegotiation   uint16 = 6
-	RecordPortNegotiation     uint16 = 7
-	RecordCompliantExporter   uint16 = 1024
+	RecordEndOfMessage      uint16 = 0
+	RecordNextProtocol      uint16 = 1
+	RecordError             uint16 = 2
+	RecordWarning           uint16 = 3
+	RecordAeadNegotiation   uint16 = 4
+	RecordNewCookie         uint16 = 5
+	RecordServerNegotiation uint16 = 6
+	RecordPortNegotiation   uint16 = 7
+	RecordCompliantExporter uint16 = 1024
 )
 
 var (
-	ErrRecordTooShort     = errors.New("nts-ke record shorter than 4-byte header")
-	ErrRecordCapExceeded  = errors.New("nts-ke record exceeded maximum capacity")
-	ErrUnknownCritical    = errors.New("unknown critical nts-ke record")
-	ErrWarningEncountered = errors.New("nts-ke server returned warning record")
-	ErrMissingEndOfMessage= errors.New("nts-ke response missing end-of-message record as last record")
-	ErrNtsKeFailed        = errors.New("nts-ke key exchange failed")
+	ErrRecordTooShort      = errors.New("nts-ke record shorter than 4-byte header")
+	ErrRecordCapExceeded   = errors.New("nts-ke record exceeded maximum capacity")
+	ErrUnknownCritical     = errors.New("unknown critical nts-ke record")
+	ErrWarningEncountered  = errors.New("nts-ke server returned warning record")
+	ErrMissingEndOfMessage = errors.New("nts-ke response missing end-of-message record as last record")
+	ErrNtsKeFailed         = errors.New("nts-ke key exchange failed")
 )
 
 // Record represents a single framed NTS-KE record.

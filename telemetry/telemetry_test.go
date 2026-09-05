@@ -2,7 +2,6 @@ package telemetry
 
 import (
 	"testing"
-
 )
 
 func TestMetricsRecord(t *testing.T) {
