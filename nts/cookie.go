@@ -51,7 +51,7 @@ func (cj *CookieJar) AddCookies(newCookies [][]byte) int {
 
 	added := 0
 	for _, raw := range newCookies {
-		if len(raw) == 0 || len(raw) > 512 {
+		if len(raw) == 0 || len(raw) > MaxKERecordSize {
 			continue
 		}
 		// Clean up spent cookies if at capacity
