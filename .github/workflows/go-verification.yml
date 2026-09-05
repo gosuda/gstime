@@ -1,0 +1,73 @@
+name: Go verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-verification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Race and integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # Zero dependencies: no go.sum to key a cache.
+      - name: Unit and race tests
+        run: go test -race -shuffle=on -count=1 ./...
+      - name: Loopback integration and race tests
+        run: go test -race -tags integration -shuffle=on -count=1 ./...
+      - name: NTS-KE parser fuzz smoke
+        run: go test ./nts -run '^$' -fuzz '^FuzzReadServerResponse$' -fuzztime=5s -parallel=2
+
+  quality:
+    name: Static checks and vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Formatting and module hygiene
+        shell: bash
+        run: |
+          files=$(gofmt -l .)
+          if [[ -n "$files" ]]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+          go mod tidy
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+      - name: Vet both build profiles
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+      - name: Baseline-aware lint
+        # Frozen pre-fix main baseline: three pre-existing ineffectual assignments
+        # in clock/public.go and internal/siv/aes_gcm_siv.go are not introduced here.
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --no-config --default=none --enable=govet --enable=ineffassign --build-tags=integration --new-from-rev=5b4826e5c712e77f947d73e69f24b940ac3ad4f9 ./...
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -tags integration ./...
