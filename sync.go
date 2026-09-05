@@ -28,7 +28,8 @@ import (
 // Implementations must acquire fresh evidence during this round, on the supplied
 // service raw clock and its current continuity/scale envelope. Cached results
 // from an earlier round or clock generation must not be returned. HardInterval
-// describes GST time at RawMid, not at query completion.
+// describes GST time at RawMid, not at query completion. RawMidReadBound must
+// bound acquisition error in that raw coordinate (zero explicitly means exact).
 type SourceQuerier interface {
 	QuerySource(ctx context.Context, src config.SourceConfig, rawNow core.RawNanos) (*ntp.MeasurementResult, error)
 }
@@ -182,16 +183,18 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if e.closed.Load() {
+		return errors.New("sync engine is closed")
+	}
 	defer func() {
-		if pollErr != nil {
+		// Parent cancellation or engine shutdown is not a failed evidence round.
+		// A per-source timeout with a live parent still counts as a failure.
+		if pollErr != nil && ctx.Err() == nil && !e.closed.Load() {
 			pollErr = errors.Join(pollErr, e.svc.markRoundFailure(e.cfg.Assurance.MaxHoldoverAgeNs))
 		}
 	}()
 	startReading := e.svc.rawClock.Read()
 	scaleLow, scaleUpp := e.svc.rawClock.ScaleEnvelope()
-	if e.closed.Load() {
-		return errors.New("sync engine is closed")
-	}
 
 	type sourceResult struct {
 		domain string
@@ -217,6 +220,9 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 
 	wg.Wait()
 	close(results)
+	if e.closed.Load() {
+		return errors.New("sync engine is closed")
+	}
 
 	// Every interval must refer to this same reading, not to its individual RawMid.
 	reading := e.svc.rawClock.Read()
@@ -245,7 +251,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 		}
 		sample := &assurance.AssuranceAnchor{
 			RawAnchor: r.res.RawMid, LowerAtAnchor: r.res.HardInterval.Earliest, UpperAtAnchor: r.res.HardInterval.Latest,
-			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: startReading.ReadBound,
+			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: r.res.RawMidReadBound,
 			ContinuityToken: reading.ContinuityToken, ValidUntilRaw: nowRaw,
 		}
 		inv, err := assurance.PropagateAnchor(sample, nowRaw, reading.ReadBound, reading.ContinuityToken, 0, 0, e.cfg.Assurance.MaxWidthNs)
@@ -338,6 +344,23 @@ func (q *defaultSourceQuerier) QuerySource(ctx context.Context, src config.Sourc
 	return q.queryNTP(ctx, src.Endpoint)
 }
 
+// localUnixEstimate applies the same leap policy and wall-clock fallback to
+// send and receive readings in both acquisition transports.
+func (q *defaultSourceQuerier) localUnixEstimate(raw core.RawNanos) (int64, error) {
+	var unix int64
+	if q.estClock != nil {
+		snap := q.estClock.Snapshot()
+		if est, err := snap.Evaluate(raw); err == nil && est > 0 {
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return 0, errors.New("local estimate is in a leap second")
+			}
+			unix = int64(projection.Nanos)
+		}
+	}
+	return cmp.Or(unix, time.Now().UnixNano()), nil
+}
+
 func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*ntp.MeasurementResult, error) {
 	d := net.Dialer{Timeout: q.timeout}
 	conn, err := d.DialContext(ctx, "udp", endpoint)
@@ -360,19 +383,10 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	reqBytes := req.Encode()
 
 	r1 := q.rawClock.Read()
-	t1Raw := r1.Raw
-	var t1Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			projection := q.leapHistory.GstInstantToUnixProjection(est)
-			if projection.IsLeapSecond {
-				return nil, errors.New("local estimate is in a leap second")
-			}
-			t1Unix = int64(projection.Nanos)
-		}
+	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
 
 	_, err = conn.Write(reqBytes)
 	if err != nil {
@@ -386,19 +400,10 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	}
 
 	r4 := q.rawClock.Read()
-	t4Raw := r4.Raw
-	var t4Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			projection := q.leapHistory.GstInstantToUnixProjection(est)
-			if projection.IsLeapSecond {
-				return nil, errors.New("local estimate is in a leap second")
-			}
-			t4Unix = int64(projection.Nanos)
-		}
+	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
 
 	resp, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
@@ -462,29 +467,25 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	fullPacket := append(headerBytes, extBytes...)
 
 	r1 := q.rawClock.Read()
-	t1Raw := r1.Raw
-	var t1Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			projection := q.leapHistory.GstInstantToUnixProjection(est)
-			if projection.IsLeapSecond {
-				return nil, errors.New("local estimate is in a leap second")
-			}
-			t1Unix = int64(projection.Nanos)
-		}
+	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
 
 	_, err = conn.Write(fullPacket)
 	if err != nil {
 		return nil, err
 	}
 
-	buf := make([]byte, 2048)
+	// One extra byte prevents accepting a valid-looking prefix of an oversized
+	// datagram. The buffer covers authenticated replacement cookies as well.
+	buf := make([]byte, nts.MaxPacketSize+1)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err
+	}
+	if n > nts.MaxPacketSize {
+		return nil, nts.ErrPacketTooLarge
 	}
 
 	if n < 48 {
@@ -492,19 +493,10 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	}
 
 	r4 := q.rawClock.Read()
-	t4Raw := r4.Raw
-	var t4Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			projection := q.leapHistory.GstInstantToUnixProjection(est)
-			if projection.IsLeapSecond {
-				return nil, errors.New("local estimate is in a leap second")
-			}
-			t4Unix = int64(projection.Nanos)
-		}
+	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
 
 	resp, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
@@ -663,7 +655,9 @@ func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint stri
 		}
 	}
 	jar := nts.NewCookieJar()
-	jar.AddCookies(response.Cookies)
+	if jar.AddCookies(response.Cookies) == 0 {
+		return nil, errors.New("NTS-KE supplied no usable cookies")
+	}
 	return &ntsSession{c2sKey: c2sKey, s2cKey: s2cKey, c2sAead: c2sAead, s2cAead: s2cAead, jar: jar,
 		udpEndpoint: net.JoinHostPort(udpHost, strconv.Itoa(int(response.Port)))}, nil
 }

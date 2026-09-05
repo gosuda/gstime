@@ -45,13 +45,14 @@ func NewCookieJar() *CookieJar {
 }
 
 // AddCookies adds newly decrypted cookies into the UNUSED inventory up to capacity.
+// Empty cookies and cookies larger than MaxCookieSize are not retained.
 func (cj *CookieJar) AddCookies(newCookies [][]byte) int {
 	cj.mu.Lock()
 	defer cj.mu.Unlock()
 
 	added := 0
 	for _, raw := range newCookies {
-		if len(raw) == 0 || len(raw) > 512 {
+		if !validCookieSize(len(raw)) {
 			continue
 		}
 		// Clean up spent cookies if at capacity
@@ -156,6 +157,8 @@ func (cj *CookieJar) MarkSpent(cookieID [16]byte) {
 
 // CalculatePlaceholderCount calculates how many Cookie Placeholders to request
 // so the projected post-response inventory does not exceed COOKIE_TARGET.
+// This is an inventory upper bound; BuildProtectedRequest also applies the
+// selected cookie's wire-size budget.
 func (cj *CookieJar) CalculatePlaceholderCount() int {
 	unused, inFlight, _ := cj.Counts()
 	projected := unused + inFlight
@@ -163,5 +166,5 @@ func (cj *CookieJar) CalculatePlaceholderCount() int {
 	if needed < 0 {
 		return 0
 	}
-	return needed
+	return min(needed, MaxPlaceholderCount)
 }

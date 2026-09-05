@@ -414,6 +414,9 @@ func (s *ClockService) publishSyncRound(selection clock.RawReading, low, upp cor
 	consensus *source.AssuranceConsensusResult, validUntil RawNanos) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
+	if err := assurance.ValidateHull(consensus.Hull, s.assuranceClock.Snapshot().MaxAssuranceWidthNs); err != nil {
+		return err
+	}
 	current := s.rawClock.Read()
 	currentLow, currentUpp := s.rawClock.ScaleEnvelope()
 	if current.Raw < selection.Raw || current.ContinuityToken != selection.ContinuityToken ||
@@ -427,7 +430,10 @@ func (s *ClockService) publishSyncRound(selection clock.RawReading, low, upp cor
 	if err != nil {
 		return errors.Join(err, s.publishCurrent())
 	}
-	center := consensus.Hull.Earliest + (consensus.Hull.Latest-consensus.Hull.Earliest)/2
+	// ValidateHull bounds the unsigned span before conversion, including intervals
+	// crossing zero or adjacent to either signed endpoint.
+	span := uint64(consensus.Hull.Latest) - uint64(consensus.Hull.Earliest)
+	center := consensus.Hull.Earliest + core.GstInstant(span/2)
 	s.estimateClock.InitializeAnchors(selection.Raw, center, 0)
 	return s.publishCurrent()
 }
@@ -444,6 +450,9 @@ func (s *ClockService) PublishAssuranceRound(
 ) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
+	if err := assurance.ValidateHull(hull, s.assuranceClock.Snapshot().MaxAssuranceWidthNs); err != nil {
+		return err
+	}
 	reading := s.rawClock.Read()
 	scaleLow, scaleUpp := s.rawClock.ScaleEnvelope()
 
@@ -463,9 +472,8 @@ func (s *ClockService) PublishAssuranceRound(
 		s.configID,
 	)
 	if err != nil {
-		// Update publisher with Desync snapshot
-		s.publishCurrent()
-		return err
+		// Preserve both the transition and publication errors.
+		return errors.Join(err, s.publishCurrent())
 	}
 
 	return s.publishCurrent()

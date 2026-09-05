@@ -4,6 +4,7 @@ package gstime_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -57,7 +58,7 @@ func TestRegressionNTPMustConvertUnixToGstTimescale(t *testing.T) {
 		}()
 		t.Cleanup(func() {
 			_ = conn.Close()
-			if err := <-done; err != nil {
+			if err := <-done; err != nil && !errors.Is(err, net.ErrClosed) {
 				t.Error(err)
 			}
 		})

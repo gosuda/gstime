@@ -30,7 +30,7 @@ func TestReadServerResponse(t *testing.T) {
 		{"noncritical_eom", []Record{proto, aead, cookie, {Type: RecordEndOfMessage}}, false},
 		{"critical_unknown", []Record{proto, aead, cookie, {Critical: true, Type: 1234}, eom}, false},
 		{"server_error", []Record{proto, aead, cookie, {Type: RecordError, Body: []byte{0, 0}}, eom}, false},
-		{"oversized_record", []Record{proto, aead, {Type: RecordNewCookie, Body: bytes.Repeat([]byte{3}, 20000)}, eom}, false},
+		{"large_record_within_message_budget", []Record{proto, aead, {Type: RecordNewCookie, Body: bytes.Repeat([]byte{3}, 20000)}, eom}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var wire []byte

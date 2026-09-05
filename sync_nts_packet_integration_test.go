@@ -23,6 +23,12 @@ import (
 // This peer follows RFC 8915's AD boundary independently of the packet helpers
 // under test. No public NTP/NTS endpoint or operating-system trust change is used.
 func TestNTSEndToEndNegotiatedPort(t *testing.T) {
+	for _, cookieSize := range []int{32, 9000} {
+		t.Run(fmt.Sprintf("cookie_%d", cookieSize), func(t *testing.T) { testNTSEndToEndNegotiatedPort(t, cookieSize) })
+	}
+}
+
+func testNTSEndToEndNegotiatedPort(t *testing.T, cookieSize int) {
 	cert := regressionNTSCertificate(t)
 	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -63,7 +69,7 @@ func TestNTSEndToEndNegotiatedPort(t *testing.T) {
 		for _, r := range []nts.Record{
 			{Critical: true, Type: nts.RecordNextProtocol, Body: []byte{0, 0}},
 			{Type: nts.RecordAeadNegotiation, Body: []byte{0, 15}},
-			{Type: nts.RecordNewCookie, Body: bytes.Repeat([]byte{1}, 32)},
+			{Type: nts.RecordNewCookie, Body: bytes.Repeat([]byte{1}, cookieSize)},
 			{Type: nts.RecordServerNegotiation, Body: []byte("127.0.0.1")},
 			{Type: nts.RecordPortNegotiation, Body: portBytes[:]},
 			{Critical: true, Type: nts.RecordEndOfMessage},
@@ -76,7 +82,7 @@ func TestNTSEndToEndNegotiatedPort(t *testing.T) {
 	const unixSeconds int64 = 1704067200
 	go func() {
 		_ = udp.SetDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, 4096)
+		buf := make([]byte, 65536)
 		n, peer, err := udp.ReadFrom(buf)
 		if err != nil {
 			serverErrors <- err
@@ -119,7 +125,7 @@ func TestNTSEndToEndNegotiatedPort(t *testing.T) {
 		pre := ntp.EncodeExtensionFields([]ntp.ExtensionField{{Type: nts.ExtTypeUniqueID, Value: fields[0].Value}})
 		ad := append(append([]byte{}, header...), pre...)
 		nonce := bytes.Repeat([]byte{9}, s2c.NonceSize()) // single response under this ephemeral key
-		plain := ntp.EncodeExtensionFields([]ntp.ExtensionField{{Type: nts.ExtTypeCookie, Value: bytes.Repeat([]byte{2}, 32)}})
+		plain := ntp.EncodeExtensionFields([]ntp.ExtensionField{{Type: nts.ExtTypeCookie, Value: bytes.Repeat([]byte{2}, cookieSize)}})
 		encrypted := s2c.Seal(nil, nonce, plain, ad)
 		body := make([]byte, 4+len(nonce)+len(encrypted))
 		binary.BigEndian.PutUint16(body[:2], uint16(len(nonce)))

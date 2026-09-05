@@ -172,6 +172,18 @@ func (ac *AssuranceClock) Snapshot() AssuranceState {
 	return ac.state
 }
 
+// ValidateHull checks ordering and the full width without signed subtraction.
+// Call before changing any assurance, estimate, or publication state.
+func ValidateHull(hull core.TimeInterval, maxWidthNs int64) error {
+	if hull.Earliest > hull.Latest || maxWidthNs <= 0 {
+		return core.ErrInvalidRange
+	}
+	if uint64(hull.Latest)-uint64(hull.Earliest) >= uint64(maxWidthNs) {
+		return ErrBoundTooWide
+	}
+	return nil
+}
+
 // ProcessFullRound integrates a newly computed consensus hull with existing state (Sections 6.4, 6.7).
 func (ac *AssuranceClock) ProcessFullRound(
 	rSel core.RawNanos,
@@ -191,6 +203,9 @@ func (ac *AssuranceClock) ProcessFullRound(
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 
+	if err := ValidateHull(hull, ac.state.MaxAssuranceWidthNs); err != nil {
+		return nil, err
+	}
 	publishedInterval := hull
 
 	// If an existing valid anchor exists on matching domains, compute intersection

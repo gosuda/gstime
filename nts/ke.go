@@ -10,8 +10,11 @@ import (
 )
 
 const (
+	// RFC 8915 section 4 recommends accepting responses of at least 65536
+	// octets. A record body may use the full 16-bit length range; only the
+	// complete message budget limits allocations in ReadServerResponse.
 	MaxKEMessageSize = 64 * 1024
-	MaxKERecordSize  = 16 * 1024
+	MaxKERecordSize  = 65535
 )
 
 // KeyExchangeResponse contains a fully validated NTPv4 NTS-KE response.
@@ -31,6 +34,9 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 	seen := make(map[uint16]bool)
 	total := 0
 	for {
+		if total > MaxKEMessageSize-4 {
+			return nil, ErrRecordCapExceeded
+		}
 		var header [4]byte
 		if _, err := io.ReadFull(r, header[:]); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrMissingEndOfMessage, err)
@@ -40,7 +46,7 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 		critical := word&0x8000 != 0
 		size := int(binary.BigEndian.Uint16(header[2:]))
 		total += 4 + size
-		if size > MaxKERecordSize || total > MaxKEMessageSize {
+		if total > MaxKEMessageSize {
 			return nil, ErrRecordCapExceeded
 		}
 		body := make([]byte, size)
@@ -78,8 +84,8 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 			}
 			response.AEAD = id
 		case RecordNewCookie:
-			if size == 0 {
-				return nil, errors.New("empty NTS cookie")
+			if !validCookieSize(size) {
+				return nil, ErrInvalidCookie
 			}
 			response.Cookies = append(response.Cookies, body)
 		case RecordError:
