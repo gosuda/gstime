@@ -141,6 +141,19 @@ Run the standalone executable example:
 go run ./examples/main.go
 ```
 
+### Deterministic Simulation Testing (DST)
+
+GSTime includes a deterministic simulation testing (DST) harness (`dst_test.go`) inspired by FoundationDB and Antithesis. It runs discrete time simulation with pseudorandom fault injection across PRNG seeds:
+- **VM Snapshot Rollbacks**: Hardware counter rewinds and continuity token changes (verifying fail-fast `StatusDesync`).
+- **Hypervisor Freezes / Suspends**: VM pause/migration for 10s–60s across validity horizons.
+- **OS Clock Shaking**: Oscillator frequency wander (up to ±180 ppm) and sampling noise.
+- **Byzantine Upstreams**: Outlier sources (+1 hour offsets) filtered by Marzullo/Hull consensus.
+- **Strict Invariants**: Proves public clock monotonicity ($P_{k+1} \ge P_k$), true time containment ($P \pm \epsilon$ and $[L, U]$), and 100% bitwise trace reproducibility across identical seeds.
+
+```bash
+go test -v -run TestDST .
+```
+
 ## Package Layout
 
 ```

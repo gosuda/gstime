@@ -63,6 +63,14 @@ func (s *SimulatedRawClock) ScaleEnvelope() (core.RateScale, core.RateScale) {
 	return s.scaleLower, s.scaleUpper
 }
 
+// SetScaleEnvelope sets the physical oscillator scale bounds for simulation.
+func (s *SimulatedRawClock) SetScaleEnvelope(lower, upper core.RateScale) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scaleLower = lower
+	s.scaleUpper = upper
+}
+
 func (s *SimulatedRawClock) IncludesSuspend() bool {
 	return true
 }

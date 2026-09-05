@@ -115,7 +115,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 	}
 }
 
-func TestClockService_DSTSimulator(t *testing.T) {
+func TestClockService_DaylightSavingTime(t *testing.T) {
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
 	lh, _ := NewLeapHistory(10, []LeapEntry{})
 	var cfgID [32]byte
