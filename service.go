@@ -1,0 +1,320 @@
+package gstime
+
+import (
+	"context"
+	"errors"
+	"math"
+	"time"
+
+	"github.com/gosuda/gstime/assurance"
+	"github.com/gosuda/gstime/clock"
+	"github.com/gosuda/gstime/publish"
+)
+
+// ClockService coordinates acquisition, discipline, and assurance publishing (Section 1.3).
+type ClockService struct {
+	rawClock       clock.RawClock
+	estimateClock  *clock.EstimateClock
+	assuranceClock *assurance.AssuranceClock
+	publicClock    *clock.PublicClock
+	publisher      *publish.Publisher
+	leapHistory    *LeapHistory
+	configID       [32]byte
+	epochID        [16]byte
+}
+
+// NewClockService creates and initializes a ClockService.
+func NewClockService(
+	raw clock.RawClock,
+	lh *LeapHistory,
+	cfgID [32]byte,
+	maxAssuranceWidthNs int64,
+) *ClockService {
+	scaleLow, scaleUpp := raw.ScaleEnvelope()
+	estClk := clock.NewEstimateClock()
+	assClk := assurance.NewAssuranceClock(maxAssuranceWidthNs)
+	pubClk := clock.NewPublicClock()
+
+	initialSnap := &publish.Snapshot{
+		EstimateMapping:  estClk.Snapshot(),
+		Assurance:        assClk.Snapshot(),
+		RawScaleLower:    scaleLow,
+		RawScaleUpper:    scaleUpp,
+		ContinuityToken:  1,
+		LeapHistoryID:    lh.ID,
+		ConfigID:         cfgID,
+		AssuranceEpochID: assClk.Snapshot().AssuranceEpochID,
+		Generation:       1,
+	}
+
+	publisher := publish.NewPublisher(initialSnap)
+
+	return &ClockService{
+		rawClock:       raw,
+		estimateClock:  estClk,
+		assuranceClock: assClk,
+		publicClock:    pubClk,
+		publisher:      publisher,
+		leapHistory:    lh,
+		configID:       cfgID,
+		epochID:        assClk.Snapshot().AssuranceEpochID,
+	}
+}
+
+// Now performs a single raw clock read and evaluates the assured snapshot (Section 7.2).
+func (s *ClockService) Now() AssuredNow {
+	reading := s.rawClock.Read()
+	snap := s.publisher.Acquire()
+
+	est, _ := snap.EstimateMapping.Evaluate(reading.Raw)
+
+	if snap.Assurance.Status == StatusSynced || snap.Assurance.Status == StatusHoldover {
+		inv, err := assurance.PropagateAnchor(
+			snap.Assurance.Anchor,
+			reading.Raw,
+			reading.ReadBound,
+			reading.ContinuityToken,
+			snap.Assurance.LowerDebt,
+			snap.Assurance.UpperDebt,
+			snap.Assurance.MaxAssuranceWidthNs,
+		)
+
+		if err == nil {
+			d1 := math.Abs(float64(est - inv.Earliest))
+			d2 := math.Abs(float64(inv.Latest - est))
+			symEps := ErrorNs(math.Max(d1, d2))
+
+			return AssuredNow{
+				Interval:            inv,
+				Estimate:            &est,
+				SymmetricEpsilon:    &symEps,
+				Status:              snap.Assurance.Status,
+				Reason:              snap.Assurance.Reason,
+				AssuranceGeneration: snap.Assurance.Generation,
+				MappingGeneration:   snap.EstimateMapping.MappingGeneration,
+				AssuranceEpochID:    snap.AssuranceEpochID,
+				LeapHistoryID:       snap.LeapHistoryID,
+				ConfigID:            snap.ConfigID,
+				FaultBudget:         snap.Assurance.Anchor.SourceFaultBudget,
+				EligibleDomains:     snap.Assurance.Anchor.EligibleDomains,
+				Age:                 DurationNs(reading.Raw - snap.Assurance.Anchor.CreatedRaw),
+			}
+		}
+
+		// Propagation error: anchor expired or bound too wide
+		return AssuredNow{
+			Interval:            nil,
+			Estimate:            &est,
+			SymmetricEpsilon:    nil,
+			Status:              StatusDesync,
+			Reason:              ReasonBoundTooOld,
+			AssuranceGeneration: snap.Assurance.Generation,
+			MappingGeneration:   snap.EstimateMapping.MappingGeneration,
+			AssuranceEpochID:    snap.AssuranceEpochID,
+			LeapHistoryID:       snap.LeapHistoryID,
+			ConfigID:            snap.ConfigID,
+		}
+	}
+
+	// UNANCHORED or DESYNC: return no interval
+	return AssuredNow{
+		Interval:            nil,
+		Estimate:            &est,
+		SymmetricEpsilon:    nil,
+		Status:              snap.Assurance.Status,
+		Reason:              snap.Assurance.Reason,
+		AssuranceGeneration: snap.Assurance.Generation,
+		MappingGeneration:   snap.EstimateMapping.MappingGeneration,
+		AssuranceEpochID:    snap.AssuranceEpochID,
+		LeapHistoryID:       snap.LeapHistoryID,
+		ConfigID:            snap.ConfigID,
+	}
+}
+
+// NowUtc converts Now endpoints and estimate to UtcLabel using the snapshot leap history (Section 7.3).
+func (s *ClockService) NowUtc(expectedLeapID [32]byte) (earliest, latest UtcLabel, est *UtcLabel, status SyncStatus, err error) {
+	if expectedLeapID != s.leapHistory.ID {
+		return UtcLabel{}, UtcLabel{}, nil, StatusDesync, ErrLeapHistoryMismatch
+	}
+
+	now := s.Now()
+	if now.Estimate != nil {
+		e := s.leapHistory.GstInstantToUtc(*now.Estimate)
+		est = &e
+	}
+
+	if now.Interval == nil {
+		return UtcLabel{}, UtcLabel{}, est, now.Status, nil
+	}
+
+	earliest = s.leapHistory.GstInstantToUtc(now.Interval.Earliest)
+	latest = s.leapHistory.GstInstantToUtc(now.Interval.Latest)
+	return earliest, latest, est, now.Status, nil
+}
+
+// NowUnixProjection returns the POSIX projection with leap ambiguity flags (Section 7.4).
+func (s *ClockService) NowUnixProjection() (UnixProjection, error) {
+	now := s.Now()
+	if now.Estimate == nil {
+		return UnixProjection{}, errors.New("estimate unavailable")
+	}
+	return s.leapHistory.GstInstantToUnixProjection(*now.Estimate), nil
+}
+
+// After implements the tri-state decision operation for t (Section 7.5).
+func (s *ClockService) After(t GstInstant) (Decision, SyncStatus, StatusReason) {
+	now := s.Now()
+	if now.Interval == nil {
+		return Unknown, now.Status, now.Reason
+	}
+	if now.Interval.Earliest > t {
+		return CertainYes, now.Status, now.Reason
+	}
+	if now.Interval.Latest <= t {
+		return CertainNo, now.Status, now.Reason
+	}
+	return Unknown, now.Status, now.Reason
+}
+
+// Before implements the tri-state decision operation for t (Section 7.5).
+func (s *ClockService) Before(t GstInstant) (Decision, SyncStatus, StatusReason) {
+	now := s.Now()
+	if now.Interval == nil {
+		return Unknown, now.Status, now.Reason
+	}
+	if now.Interval.Latest < t {
+		return CertainYes, now.Status, now.Reason
+	}
+	if now.Interval.Earliest >= t {
+		return CertainNo, now.Status, now.Reason
+	}
+	return Unknown, now.Status, now.Reason
+}
+
+// PastWatermark returns the certified monotonic lower watermark (Section 7.6).
+func (s *ClockService) PastWatermark(
+	epochID [16]byte,
+	leapID [32]byte,
+	cfgID [32]byte,
+) (GstInstant, SyncStatus, error) {
+	snap := s.publisher.Acquire()
+
+	if snap.AssuranceEpochID != epochID {
+		return 0, snap.Assurance.Status, ErrConfigurationMismatch
+	}
+	if snap.LeapHistoryID != leapID {
+		return 0, snap.Assurance.Status, ErrLeapHistoryMismatch
+	}
+	if snap.ConfigID != cfgID {
+		return 0, snap.Assurance.Status, ErrConfigurationMismatch
+	}
+
+	if snap.Assurance.Status == StatusUnanchored {
+		return 0, snap.Assurance.Status, ErrUnanchored
+	}
+	if snap.Assurance.Status == StatusDesync {
+		return 0, snap.Assurance.Status, ErrDesynchronized
+	}
+
+	return snap.Assurance.PastWatermark, snap.Assurance.Status, nil
+}
+
+// CommitWait blocks until certified PastWatermark is strictly greater than commitTs (Section 7.7).
+func (s *ClockService) CommitWait(
+	ctx context.Context,
+	commitTs GstInstant,
+	epochID [16]byte,
+	leapID [32]byte,
+	cfgID [32]byte,
+) error {
+	for {
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return ErrDeadlineExceeded
+			}
+			return ErrCancelled
+		default:
+		}
+
+		wm, status, err := s.PastWatermark(epochID, leapID, cfgID)
+		if err != nil {
+			return err
+		}
+		if status == StatusDesync {
+			return ErrDesynchronized
+		}
+
+		if wm > commitTs {
+			return nil // Guaranteed committed strictly after commitTs
+		}
+
+		// Yield or brief wait before re-checking
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
+// PublishAssuranceRound updates internal state and publishes a new snapshot.
+func (s *ClockService) PublishAssuranceRound(
+	rSel RawNanos,
+	hull TimeInterval,
+	faultBudget uint32,
+	eligibleDomains uint32,
+	coverageThreshold uint32,
+	componentCount uint32,
+	validUntilRaw RawNanos,
+) error {
+	reading := s.rawClock.Read()
+	scaleLow, scaleUpp := s.rawClock.ScaleEnvelope()
+
+	_, err := s.assuranceClock.ProcessFullRound(
+		rSel,
+		hull,
+		reading.ReadBound,
+		scaleLow,
+		scaleUpp,
+		reading.ContinuityToken,
+		validUntilRaw,
+		faultBudget,
+		eligibleDomains,
+		coverageThreshold,
+		componentCount,
+		s.leapHistory.ID,
+		s.configID,
+	)
+	if err != nil {
+		// Update publisher with Desync snapshot
+		s.publishCurrent()
+		return err
+	}
+
+	return s.publishCurrent()
+}
+
+// InitializeEstimate anchors the estimate clock.
+func (s *ClockService) InitializeEstimate(raw0 RawNanos, target GstInstant, baseRate RateFrac) error {
+	s.estimateClock.InitializeAnchors(raw0, target, baseRate)
+	return s.publishCurrent()
+}
+
+func (s *ClockService) publishCurrent() error {
+	reading := s.rawClock.Read()
+	scaleLow, scaleUpp := s.rawClock.ScaleEnvelope()
+
+	currSnap := s.publisher.Acquire()
+	gen := currSnap.Generation + 1
+
+	nextSnap := &publish.Snapshot{
+		EstimateMapping:  s.estimateClock.Snapshot(),
+		Assurance:        s.assuranceClock.Snapshot(),
+		RawScaleLower:    scaleLow,
+		RawScaleUpper:    scaleUpp,
+		ContinuityToken:  reading.ContinuityToken,
+		LeapHistoryID:    s.leapHistory.ID,
+		ConfigID:         s.configID,
+		AssuranceEpochID: s.epochID,
+		Generation:       gen,
+	}
+
+	return s.publisher.Publish(nextSnap)
+}
