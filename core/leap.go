@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -282,6 +283,32 @@ func (lh *LeapHistory) UtcToGstInstant(utc UtcLabel) (GstInstant, error) {
 	siSec := unixSec + cumDelta
 	inst := GstInstant(siSec*1_000_000_000 + int64(utc.Nanos))
 	return inst, nil
+}
+
+// UnixNanosToGstInstant converts an unambiguous POSIX instant using this history.
+// The repeated second before a positive leap (or deleted second before a
+// negative leap) is rejected: POSIX does not identify a unique valid UTC label.
+// InitialTaiMinusUtc is metadata, not an additional epoch offset.
+func (lh *LeapHistory) UnixNanosToGstInstant(unix UnixNanos) (GstInstant, error) {
+	sec := FloorDiv(int64(unix), 1_000_000_000)
+	var delta int64
+	for _, e := range lh.Entries {
+		if e.TransitionUnixSecond != math.MinInt64 && sec == e.TransitionUnixSecond-1 {
+			return 0, errors.New("ambiguous or deleted Unix second at leap transition")
+		}
+		if sec >= e.TransitionUnixSecond {
+			delta += int64(e.Delta)
+		}
+	}
+	if delta > math.MaxInt64/1_000_000_000 || delta < math.MinInt64/1_000_000_000 {
+		return 0, ErrOverflow
+	}
+	offset := delta * 1_000_000_000
+	v := int64(unix)
+	if (offset > 0 && v > math.MaxInt64-offset) || (offset < 0 && v < math.MinInt64-offset) {
+		return 0, ErrOverflow
+	}
+	return GstInstant(v + offset), nil
 }
 
 // GstInstantToUnixProjection projects GstInstant to POSIX UnixNanos.

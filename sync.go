@@ -98,7 +98,7 @@ func NewSyncEngine(cfg config.Config, svc *ClockService, opts ...SyncOption) (*S
 	}
 
 	if engine.querier == nil {
-		engine.querier = newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, engine.queryTimeout)
+		engine.querier = newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, svc.leapHistory, engine.queryTimeout)
 	}
 
 	return engine, nil
@@ -308,11 +308,12 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 }
 
 type defaultSourceQuerier struct {
-	rawClock clock.RawClock
-	estClock *clock.EstimateClock
-	timeout  time.Duration
-	ntsMu    sync.Mutex
-	ntsState map[string]*ntsSession
+	rawClock    clock.RawClock
+	estClock    *clock.EstimateClock
+	leapHistory *core.LeapHistory
+	timeout     time.Duration
+	ntsMu       sync.Mutex
+	ntsState    map[string]*ntsSession
 }
 
 type ntsSession struct {
@@ -323,12 +324,13 @@ type ntsSession struct {
 	jar     *nts.CookieJar
 }
 
-func newDefaultSourceQuerier(rc clock.RawClock, ec *clock.EstimateClock, timeout time.Duration) *defaultSourceQuerier {
+func newDefaultSourceQuerier(rc clock.RawClock, ec *clock.EstimateClock, lh *core.LeapHistory, timeout time.Duration) *defaultSourceQuerier {
 	return &defaultSourceQuerier{
-		rawClock: rc,
-		estClock: ec,
-		timeout:  timeout,
-		ntsState: make(map[string]*ntsSession),
+		rawClock:    rc,
+		estClock:    ec,
+		leapHistory: lh,
+		timeout:     timeout,
+		ntsState:    make(map[string]*ntsSession),
 	}
 }
 
@@ -366,7 +368,11 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	if q.estClock != nil {
 		snap := q.estClock.Snapshot()
 		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			t1Unix = int64(est)
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return nil, errors.New("local estimate is in a leap second")
+			}
+			t1Unix = int64(projection.Nanos)
 		}
 	}
 	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
@@ -388,7 +394,11 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	if q.estClock != nil {
 		snap := q.estClock.Snapshot()
 		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			t4Unix = int64(est)
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return nil, errors.New("local estimate is in a leap second")
+			}
+			t4Unix = int64(projection.Nanos)
 		}
 	}
 	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
@@ -402,38 +412,7 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 		return nil, fmt.Errorf("kiss-of-death received: %s", code)
 	}
 
-	coarseSec := time.Now().Unix()
-	t2Unix, err := ntp.UnfoldTimestamp(resp.RecvTimestamp, coarseSec)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T2: %w", err)
-	}
-	t3Unix, err := ntp.UnfoldTimestamp(resp.TxTimestamp, coarseSec)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T3: %w", err)
-	}
-
-	measIn := ntp.MeasurementInput{
-		LocalSendRaw:                t1Raw,
-		LocalRecvRaw:                t4Raw,
-		T1LocalSendEstimate:         core.GstInstant(t1Unix),
-		T2ServerRecv:                core.GstInstant(t2Unix),
-		T3ServerTx:                  core.GstInstant(t3Unix),
-		T4LocalRecvEstimate:         core.GstInstant(t4Unix),
-		LocalEstimateAtMid:          core.GstInstant(t1Unix + (t4Unix-t1Unix)/2),
-		ServerRootDelayNs:           resp.RootDelayNanoseconds(),
-		ServerRootDispersionNs:      resp.RootDispersionNanoseconds(),
-		LocalSendReadError:          core.ErrorNs(r1.ReadBound),
-		LocalRecvReadError:          core.ErrorNs(r4.ReadBound),
-		RemoteTimestampQuantization: 1000,
-		LocalMappingIntegrationErr:  1000,
-		StaticAsymmetryCorrection:   0,
-		StaticAsymmetryUncertainty:  0,
-		PrecisionFloorNs:            1000,
-		MaxServerTurnaroundNs:       2_000_000_000,
-		MaxRootDistanceNs:           16_000_000_000,
-	}
-
-	return ntp.ComputeMeasurement(measIn)
+	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
 }
 
 func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceConfig) (*ntp.MeasurementResult, error) {
@@ -493,7 +472,11 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	if q.estClock != nil {
 		snap := q.estClock.Snapshot()
 		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			t1Unix = int64(est)
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return nil, errors.New("local estimate is in a leap second")
+			}
+			t1Unix = int64(projection.Nanos)
 		}
 	}
 	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
@@ -519,7 +502,11 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	if q.estClock != nil {
 		snap := q.estClock.Snapshot()
 		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			t4Unix = int64(est)
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return nil, errors.New("local estimate is in a leap second")
+			}
+			t4Unix = int64(projection.Nanos)
 		}
 	}
 	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
@@ -543,6 +530,14 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		sess.jar.AddCookies(newCookies)
 	}
 
+	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
+}
+
+func (q *defaultSourceQuerier) measureResponse(resp *ntp.Packet, r1, r4 clock.RawReading, t1Unix, t4Unix int64) (*ntp.MeasurementResult, error) {
+	t1Raw, t4Raw := r1.Raw, r4.Raw
+	if resp.Version != 4 || resp.Mode != 4 || resp.Stratum < 1 || resp.Stratum > 15 || resp.LeapIndicator != 0 {
+		return nil, errors.New("unsupported, unsynchronized, or leap-announcing NTP response")
+	}
 	coarseSec := time.Now().Unix()
 	t2Unix, err := ntp.UnfoldTimestamp(resp.RecvTimestamp, coarseSec)
 	if err != nil {
@@ -553,6 +548,9 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		return nil, fmt.Errorf("failed to unfold T3: %w", err)
 	}
 
+	if err := q.checkUnixInterval(t2Unix, t3Unix); err != nil {
+		return nil, err
+	}
 	measIn := ntp.MeasurementInput{
 		LocalSendRaw:                t1Raw,
 		LocalRecvRaw:                t4Raw,
@@ -574,7 +572,44 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		MaxRootDistanceNs:           16_000_000_000,
 	}
 
-	return ntp.ComputeMeasurement(measIn)
+	m, err := ntp.ComputeMeasurement(measIn)
+	if err != nil {
+		return nil, err
+	}
+	if err := q.checkUnixInterval(int64(m.HardInterval.Earliest), int64(m.HardInterval.Latest)); err != nil {
+		return nil, err
+	}
+	lo, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Earliest))
+	if err != nil {
+		return nil, err
+	}
+	hi, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Latest))
+	if err != nil {
+		return nil, err
+	}
+	center, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.Center))
+	if err != nil {
+		return nil, err
+	}
+	m.HardInterval = core.TimeInterval{Earliest: lo, Latest: hi}
+	m.Center = center
+	return m, nil
+}
+
+// Only unsmeared UTC/NTP sources are supported. Reject intervals crossing the
+// repeated/deleted second or the first second of a recorded transition; the wire
+// timestamps and LI field do not establish a unique SI interpretation there.
+func (q *defaultSourceQuerier) checkUnixInterval(lo, hi int64) error {
+	if lo > hi {
+		return core.ErrInvalidRange
+	}
+	first, last := core.FloorDiv(lo, 1_000_000_000), core.FloorDiv(hi, 1_000_000_000)
+	for _, e := range q.leapHistory.Entries {
+		if e.TransitionUnixSecond != math.MinInt64 && first <= e.TransitionUnixSecond && last >= e.TransitionUnixSecond-1 {
+			return errors.New("NTP interval crosses an ambiguous leap boundary")
+		}
+	}
+	return nil
 }
 
 func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint string) (*ntsSession, error) {
