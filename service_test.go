@@ -2,6 +2,7 @@ package gstime
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -367,5 +368,52 @@ func TestClockService_VMSnapshotTimeReversalAndFreeze(t *testing.T) {
 	if pubCaughtUp.Center <= highWatermark {
 		t.Fatalf("expected public clock to advance past highWatermark after catch up: high=%d got=%d",
 			highWatermark, pubCaughtUp.Center)
+	}
+}
+
+func TestClockService_WaitSync(t *testing.T) {
+	raw := clock.NewSimulatedRawClock(10_000_000_000)
+	lh, _ := NewLeapHistory(10, []LeapEntry{})
+	var cfgID [32]byte
+
+	svc := NewClockService(raw, lh, cfgID, 32_000_000_000)
+
+	// 1. Timeout when unanchored
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelTimeout()
+
+	err := svc.WaitSync(ctxTimeout)
+	if !errors.Is(err, ErrDeadlineExceeded) {
+		t.Fatalf("expected ErrDeadlineExceeded, got %v", err)
+	}
+
+	// 2. Publish round in background and wait
+	targetTime := GstInstant(1_700_000_000 * 1_000_000_000)
+	syncDone := make(chan error, 1)
+
+	ctxWait, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelWait()
+
+	go func() {
+		syncDone <- svc.WaitSync(ctxWait)
+	}()
+
+	// Publish valid round
+	_ = svc.InitializeEstimate(10_000_000_000, targetTime, 0)
+	hull := TimeInterval{Earliest: targetTime - 1_000, Latest: targetTime + 1_000}
+	_ = svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatalf("WaitSync failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for WaitSync to complete")
+	}
+
+	// 3. Already synced returns immediately
+	if err := svc.WaitSync(context.Background()); err != nil {
+		t.Fatalf("expected nil when already synced, got %v", err)
 	}
 }

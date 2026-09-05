@@ -58,6 +58,9 @@ defer cancel()
 
 _ = engine.Start(ctx)
 defer engine.Close() // Best Practice: Gracefully stops background worker with zero goroutine leaks
+
+// Wait until initial synchronization is achieved
+_ = engine.WaitSync(ctx)
 ```
 
 ### 1. PublicClock: Monotonic Presentation Time

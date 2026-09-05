@@ -141,6 +141,11 @@ func (e *SyncEngine) Close() error {
 	return nil
 }
 
+// WaitSync blocks until the underlying ClockService achieves StatusSynced, or ctx is done.
+func (e *SyncEngine) WaitSync(ctx context.Context) error {
+	return e.svc.WaitSync(ctx)
+}
+
 func (e *SyncEngine) loop(ctx context.Context) {
 	defer e.wg.Done()
 	defer e.running.Store(false)

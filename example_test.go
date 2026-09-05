@@ -169,14 +169,16 @@ func Example_syncEngineBackgroundPolling() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Perform initial synchronization poll
-	_ = engine.PollOnce(ctx)
-
 	// Start background polling daemon
 	_ = engine.Start(ctx)
 
 	// Best Practice: Always defer engine.Close() to stop polling goroutine and prevent goroutine leaks
 	defer engine.Close()
+
+	// WaitSync blocks until initial synchronization is achieved
+	if err := engine.WaitSync(ctx); err != nil {
+		panic(err)
+	}
 
 	now := svc.Now()
 	fmt.Printf("EngineRunning: true, Status: %s\n", now.Status)

@@ -323,3 +323,55 @@ func TestSyncEngine_RealLoopbackUDP(t *testing.T) {
 		t.Fatalf("expected StatusSynced after loopback UDP poll, got %s", now.Status)
 	}
 }
+
+func TestSyncEngine_WaitSync(t *testing.T) {
+	raw := clock.NewSimulatedRawClock(10_000_000_000)
+	lh, _ := core.NewLeapHistory(10, nil)
+	var cfgID [32]byte
+
+	cfg := config.DefaultConfig()
+	cfg.Sources = []config.SourceConfig{
+		{FaultDomainID: "d1", Endpoint: "10.0.0.1:123", NTS: false},
+		{FaultDomainID: "d2", Endpoint: "10.0.0.2:123", NTS: false},
+		{FaultDomainID: "d3", Endpoint: "10.0.0.3:123", NTS: false},
+	}
+
+	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+
+	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
+	mock := &mockQuerier{
+		results: map[string]*ntp.MeasurementResult{
+			"10.0.0.1:123": newMockMeasurement(targetTime, 20_000_000, 10_000_000_000),
+			"10.0.0.2:123": newMockMeasurement(targetTime, 25_000_000, 10_000_000_000),
+			"10.0.0.3:123": newMockMeasurement(targetTime, 22_000_000, 10_000_000_000),
+		},
+	}
+
+	engine, err := gstime.NewSyncEngine(
+		cfg,
+		svc,
+		gstime.WithPollInterval(20*time.Millisecond),
+		gstime.WithQueryTimeout(15*time.Millisecond),
+		gstime.WithSourceQuerier(mock),
+	)
+	if err != nil {
+		t.Fatalf("NewSyncEngine failed: %v", err)
+	}
+	defer engine.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := engine.Start(ctx); err != nil {
+		t.Fatalf("engine.Start failed: %v", err)
+	}
+
+	if err := engine.WaitSync(ctx); err != nil {
+		t.Fatalf("engine.WaitSync failed: %v", err)
+	}
+
+	now := svc.Now()
+	if now.Status != gstime.StatusSynced {
+		t.Fatalf("expected StatusSynced after WaitSync, got %s", now.Status)
+	}
+}

@@ -348,6 +348,45 @@ func (s *ClockService) CommitWait(
 	}
 }
 
+// WaitSync blocks until the service reaches StatusSynced, or ctx is done.
+func (s *ClockService) WaitSync(ctx context.Context) error {
+	if s.Now().Status == StatusSynced {
+		return nil
+	}
+
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer timer.Stop()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return ErrDeadlineExceeded
+			}
+			return ErrCancelled
+		}
+
+		if s.Now().Status == StatusSynced {
+			return nil
+		}
+
+		timer.Reset(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return ErrDeadlineExceeded
+			}
+			return ErrCancelled
+		case <-timer.C:
+		}
+	}
+}
+
 // PublishAssuranceRound updates internal state and publishes a new snapshot.
 func (s *ClockService) PublishAssuranceRound(
 	rSel RawNanos,
