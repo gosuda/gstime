@@ -4,7 +4,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 var (

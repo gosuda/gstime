@@ -39,3 +39,38 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatalf("expected validation error for MinVotingDomains < 2F+1")
 	}
 }
+
+func TestSourceConfigNTS(t *testing.T) {
+	s1 := SourceConfig{
+		FaultDomainID: "cloudflare",
+		Endpoint:      "time.cloudflare.com:4460",
+		NTS:           true,
+	}
+	s2 := SourceConfig{
+		FaultDomainID: "google",
+		Endpoint:      "time.google.com:123",
+		NTS:           false,
+	}
+
+	if !s1.IsNTS() {
+		t.Fatalf("expected s1.IsNTS() to be true")
+	}
+	if s2.IsNTS() {
+		t.Fatalf("expected s2.IsNTS() to be false")
+	}
+
+	cfg1 := DefaultConfig()
+	cfg1.Sources = []SourceConfig{s1, s2}
+
+	b, err := cfg1.CanonicalBytes()
+	if err != nil {
+		t.Fatalf("CanonicalBytes failed: %v", err)
+	}
+
+	if !bytes.Contains(b, []byte(`"nts":true`)) {
+		t.Fatalf("canonical JSON missing expected \"nts\":true, got: %s", string(b))
+	}
+	if !bytes.Contains(b, []byte(`"nts":false`)) {
+		t.Fatalf("canonical JSON missing expected \"nts\":false, got: %s", string(b))
+	}
+}

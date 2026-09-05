@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 // RawReading represents a single read from RawClock (Section 5.1).
@@ -72,6 +72,24 @@ func (s *SimulatedRawClock) Advance(deltaNanos core.RawNanos) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.currentRaw += deltaNanos
+}
+
+// Rewind moves simulated raw time backward by deltaNanos (simulating VM snapshot rollback).
+func (s *SimulatedRawClock) Rewind(deltaNanos core.RawNanos) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if deltaNanos > s.currentRaw {
+		s.currentRaw = 0
+	} else {
+		s.currentRaw -= deltaNanos
+	}
+}
+
+// SetRaw sets the simulated raw counter directly.
+func (s *SimulatedRawClock) SetRaw(raw core.RawNanos) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentRaw = raw
 }
 
 // SetContinuityToken simulates a platform discontinuity or counter reset.

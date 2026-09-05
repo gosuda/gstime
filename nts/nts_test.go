@@ -5,7 +5,7 @@ import (
 	"crypto/cipher"
 	"testing"
 
-	"github.com/gosuda/gstime/ntp"
+	"gosuda.org/gstime/ntp"
 )
 
 func TestNtsKeRecordFramingByteAligned(t *testing.T) {

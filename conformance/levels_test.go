@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gosuda/gstime"
-	"github.com/gosuda/gstime/clock"
-	"github.com/gosuda/gstime/core"
-	"github.com/gosuda/gstime/ntp"
-	"github.com/gosuda/gstime/source"
+	"gosuda.org/gstime"
+	"gosuda.org/gstime/clock"
+	"gosuda.org/gstime/core"
+	"gosuda.org/gstime/ntp"
+	"gosuda.org/gstime/source"
 )
 
 func TestConformance_LevelA_Wire(t *testing.T) {

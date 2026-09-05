@@ -1,3 +1,3 @@
-module github.com/gosuda/gstime
+module gosuda.org/gstime
 
 go 1.27.0

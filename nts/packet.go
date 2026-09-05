@@ -3,11 +3,12 @@ package nts
 import (
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 
-	"github.com/gosuda/gstime/ntp"
+	"gosuda.org/gstime/ntp"
 )
 
 const (
@@ -151,14 +152,9 @@ func VerifyAndDecryptResponse(
 		return nil, ErrMissingUniqueID
 	}
 
-	// Compare Unique ID
-	if len(foundUniqueID) < len(expectedUniqueID) {
+	// Constant-time Unique ID verification
+	if subtle.ConstantTimeCompare(foundUniqueID, expectedUniqueID) != 1 {
 		return nil, ErrUniqueIDMismatch
-	}
-	for i := range expectedUniqueID {
-		if foundUniqueID[i] != expectedUniqueID[i] {
-			return nil, ErrUniqueIDMismatch
-		}
 	}
 
 	// 3. Parse Authenticator field

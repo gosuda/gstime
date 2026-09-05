@@ -4,9 +4,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gosuda/gstime/assurance"
-	"github.com/gosuda/gstime/clock"
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/assurance"
+	"gosuda.org/gstime/clock"
+	"gosuda.org/gstime/core"
 )
 
 func TestPublicationGuard(t *testing.T) {

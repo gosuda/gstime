@@ -3,7 +3,7 @@ package clock
 import (
 	"sync"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 type MappingChangeKind uint8

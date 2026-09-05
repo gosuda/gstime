@@ -4,7 +4,7 @@ import (
 	"math"
 	"sync/atomic"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 // SmearSegment defines one polynomial segment in a smear plan (Section 5.14).

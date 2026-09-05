@@ -4,7 +4,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 // PollScheduler manages poll intervals and stability scoring (Section 2.14).

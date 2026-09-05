@@ -1,9 +1,10 @@
 package assurance
 
 import (
+	"errors"
 	"testing"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 func TestAssuranceClockTransitionsAndConflict(t *testing.T) {
@@ -102,5 +103,45 @@ func TestHoldoverAndWatermarkMonotonicity(t *testing.T) {
 	// In holdover, interval propagates forward: Earliest >= 1_000_000_000 + 5_000_000_000 - 20
 	if invHoldover.Earliest < 5_999_999_900 {
 		t.Fatalf("expected propagated earliest ~6s, got %d", invHoldover.Earliest)
+	}
+}
+
+func TestAssuranceClock_VMSnapshotRawTimeReversal(t *testing.T) {
+	ac := NewAssuranceClock(32_000_000_000)
+	scaleLow := core.RateScale(core.OneQ48)
+	scaleUpp := core.RateScale(core.OneQ48)
+
+	// Publish anchor at raw = 50,000,000,000 (50s)
+	h := core.TimeInterval{Earliest: 1_700_000_000 * 1_000_000_000, Latest: 1_700_000_000*1_000_000_000 + 10_000}
+	_, err := ac.ProcessFullRound(
+		50_000_000_000, h, 10, scaleLow, scaleUpp, 1, 100_000_000_000,
+		1, 3, 2, 1, [32]byte{1}, [32]byte{2},
+	)
+	if err != nil {
+		t.Fatalf("ProcessFullRound failed: %v", err)
+	}
+
+	// Normal forward evaluation at raw = 60,000,000,000 (60s)
+	inv60, status60, _, err := ac.EvaluateAt(60_000_000_000, 10, 1)
+	if err != nil || status60 != core.StatusSynced || inv60 == nil {
+		t.Fatalf("normal evaluation failed: %v", err)
+	}
+
+	// VM snapshot rollback: raw counter jumps backward to 30,000,000,000 (30s), earlier than anchor (50s)
+	inv30, status30, reason30, err := ac.EvaluateAt(30_000_000_000, 10, 1)
+	if err == nil {
+		t.Fatalf("expected error when raw time jumps earlier than anchor, got nil")
+	}
+	if !errors.Is(err, ErrRawEarlierThanAnchor) {
+		t.Fatalf("expected ErrRawEarlierThanAnchor, got %v", err)
+	}
+	if status30 != core.StatusDesync {
+		t.Fatalf("expected StatusDesync on raw rewind, got %s", status30)
+	}
+	if reason30 != core.ReasonRawDiscontinuity {
+		t.Fatalf("expected ReasonRawDiscontinuity, got %s", reason30)
+	}
+	if inv30 != nil {
+		t.Fatalf("expected nil interval on raw rewind, got %+v", inv30)
 	}
 }

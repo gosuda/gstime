@@ -34,7 +34,12 @@ type RawConfig struct {
 type SourceConfig struct {
 	FaultDomainID string `json:"faultDomainId"`
 	Endpoint      string `json:"endpoint"`
-	Required      bool   `json:"required"`
+	NTS           bool   `json:"nts"`
+}
+
+// IsNTS returns true if the source uses Network Time Security (NTS).
+func (s SourceConfig) IsNTS() bool {
+	return s.NTS
 }
 
 // Config represents the complete system configuration.

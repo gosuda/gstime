@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 func TestWeightedRegressionPlantedPhaseAndRate(t *testing.T) {

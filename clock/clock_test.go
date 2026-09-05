@@ -5,7 +5,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 func TestReanchorContinuityRandomized(t *testing.T) {
@@ -191,5 +191,135 @@ func TestPublicClockMonotonicClamp(t *testing.T) {
 	p4, d4 := pc.ReadPublicInstant(250, 4000)
 	if p4 != 250 || d4 != 0 {
 		t.Fatalf("read 4 mismatch: p4=%d d4=%d", p4, d4)
+	}
+}
+
+// TestPublicClock_DSTFallBackAndSpringForward simulates DST transitions (-1h fall back, +1h spring forward).
+func TestPublicClock_DSTFallBackAndSpringForward(t *testing.T) {
+	pc := NewPublicClock()
+	hourNs := int64(3600 * 1_000_000_000)
+
+	baseTime := core.GstInstant(1_700_000_000 * 1_000_000_000)
+	raw0 := core.RawNanos(10_000_000_000)
+
+	// Step 1: Normal steady-state reading before DST
+	pPre, debtPre := pc.ReadPublicInstant(baseTime, raw0)
+	if pPre != baseTime || debtPre != 0 {
+		t.Fatalf("pre-DST read failed: p=%d debt=%d", pPre, debtPre)
+	}
+
+	// Step 2: DST "Fall Back" (-1 hour step in raw OS / unsynchronized estimate)
+	fallBackEst := baseTime - core.GstInstant(hourNs)
+	var prevP = pPre
+
+	// Verify monotonicity over 10,000 reads during fall-back
+	for i := int64(1); i <= 10_000; i++ {
+		// Time advances slowly in nanoseconds
+		simRaw := raw0 + core.RawNanos(i*100)
+		simEst := fallBackEst + core.GstInstant(i*100)
+
+		p, debt := pc.ReadPublicInstant(simEst, simRaw)
+		if p < prevP {
+			t.Fatalf("monotonicity violated during DST fall-back at iter %d: prev=%d curr=%d", i, prevP, p)
+		}
+		if p < pPre {
+			t.Fatalf("public clock stepped backward below pre-DST value: pPre=%d got=%d", pPre, p)
+		}
+		if debt <= 0 {
+			t.Fatalf("expected positive clamp debt during fall-back, got %d", debt)
+		}
+		prevP = p
+	}
+
+	// Verify epsilon expansion covers the 1-hour deficit
+	inv := &core.TimeInterval{Earliest: fallBackEst - 1000, Latest: fallBackEst + 1000}
+	eps := ComputePublicSymmetricEpsilon(pPre, inv, 50)
+	if eps < core.ErrorNs(hourNs) {
+		t.Fatalf("epsilon does not cover DST clamp debt: eps=%d hourNs=%d", eps, hourNs)
+	}
+
+	// Step 3: Fast-forward elapsed time until estimate catches up with clamped public clock
+	catchUpRaw := raw0 + core.RawNanos(hourNs+1_000_000_000)
+	catchUpEst := baseTime + 1_000_000_000 // now 1 second past pre-DST value
+	pCaught, debtCaught := pc.ReadPublicInstant(catchUpEst, catchUpRaw)
+	if pCaught <= pPre {
+		t.Fatalf("expected clock to advance after catching up: pPre=%d pCaught=%d", pPre, pCaught)
+	}
+	if debtCaught != 0 {
+		t.Fatalf("expected clamp debt to clear after catching up, got %d", debtCaught)
+	}
+
+	// Step 4: DST "Spring Forward" (+1 hour step)
+	springForwardEst := catchUpEst + core.GstInstant(hourNs)
+	pSpring, debtSpring := pc.ReadPublicInstant(springForwardEst, catchUpRaw+1000)
+	if pSpring < pCaught {
+		t.Fatalf("monotonicity violated on spring forward: pCaught=%d pSpring=%d", pCaught, pSpring)
+	}
+	if debtSpring != 0 {
+		t.Fatalf("expected zero clamp debt on spring forward, got %d", debtSpring)
+	}
+}
+
+// TestPublicClock_VMSnapshotRollbackAndConcurrency verifies stability and zero races under VM snapshot revert.
+func TestPublicClock_VMSnapshotRollbackAndConcurrency(t *testing.T) {
+	pc := NewPublicClock()
+	baseTime := core.GstInstant(1_700_000_000 * 1_000_000_000)
+
+	// Advance clock to high value
+	pMax, _ := pc.ReadPublicInstant(baseTime+10_000_000_000, 10_000_000_000)
+
+	// Concurrent readers reading while VM snapshot rollback occurs
+	const goroutines = 20
+	const iterations = 5_000
+	done := make(chan bool, goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			var last core.GstInstant = 0
+			for i := 0; i < iterations; i++ {
+				// Simulate VM snapshot rolled back to past: estimate drops from +10s to -50s
+				simRaw := core.RawNanos(rand.Uint64N(2_000_000_000))
+				simEst := baseTime - core.GstInstant(rand.Int64N(50_000_000_000))
+
+				p, _ := pc.ReadPublicInstant(simEst, simRaw)
+				if p < pMax {
+					t.Errorf("goroutine %d: public clock rolled backward below pMax: got %d < pMax %d", id, p, pMax)
+					break
+				}
+				if p < last {
+					t.Errorf("goroutine %d: non-monotonic read: last=%d curr=%d", id, last, p)
+					break
+				}
+				last = p
+			}
+			done <- true
+		}(g)
+	}
+
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+}
+
+// TestPublicClock_DSTHighFrequencyOscillations simulates rapid oscillatory OS jitter.
+func TestPublicClock_DSTHighFrequencyOscillations(t *testing.T) {
+	pc := NewPublicClock()
+	baseTime := core.GstInstant(1_000_000_000_000)
+
+	var prevP core.GstInstant
+	for i := int64(0); i < 50_000; i++ {
+		raw := core.RawNanos((i + 1) * 1_000_000) // advancing 1ms per step
+		// Inject alternating +/- 200ms oscillatory jitter
+		jitter := int64(200_000_000)
+		if i%2 == 0 {
+			jitter = -jitter
+		}
+		est := baseTime + core.GstInstant(i*1_000_000) + core.GstInstant(jitter)
+
+		p, _ := pc.ReadPublicInstant(est, raw)
+		if p < prevP {
+			t.Fatalf("monotonicity violated on oscillation at step %d: prev=%d curr=%d", i, prevP, p)
+		}
+		prevP = p
 	}
 }

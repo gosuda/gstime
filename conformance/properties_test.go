@@ -6,14 +6,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gosuda/gstime"
-	"github.com/gosuda/gstime/assurance"
-	"github.com/gosuda/gstime/clock"
-	"github.com/gosuda/gstime/core"
-	"github.com/gosuda/gstime/ntp"
-	"github.com/gosuda/gstime/nts"
-	"github.com/gosuda/gstime/publish"
-	"github.com/gosuda/gstime/source"
+	"gosuda.org/gstime"
+	"gosuda.org/gstime/assurance"
+	"gosuda.org/gstime/clock"
+	"gosuda.org/gstime/core"
+	"gosuda.org/gstime/ntp"
+	"gosuda.org/gstime/nts"
+	"gosuda.org/gstime/publish"
+	"gosuda.org/gstime/source"
 )
 
 // P1 ReanchorContinuity: E_old(c) == E_new(c) exactly in implementation arithmetic

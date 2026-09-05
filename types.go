@@ -1,7 +1,7 @@
 package gstime
 
 import (
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 type RawNanos = core.RawNanos
@@ -19,6 +19,9 @@ const (
 	StatusSynced     = core.StatusSynced
 	StatusHoldover   = core.StatusHoldover
 	StatusDesync     = core.StatusDesync
+
+	ErrorInfinity           = core.ErrorInfinity
+	PublicEpsilonCapDefault = core.PublicEpsilonCapDefault
 )
 
 type StatusReason = core.StatusReason

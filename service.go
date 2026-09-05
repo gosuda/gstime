@@ -6,9 +6,10 @@ import (
 	"math"
 	"time"
 
-	"github.com/gosuda/gstime/assurance"
-	"github.com/gosuda/gstime/clock"
-	"github.com/gosuda/gstime/publish"
+	"gosuda.org/gstime/assurance"
+	"gosuda.org/gstime/clock"
+	"gosuda.org/gstime/core"
+	"gosuda.org/gstime/publish"
 )
 
 // ClockService coordinates acquisition, discipline, and assurance publishing (Section 1.3).
@@ -101,13 +102,14 @@ func (s *ClockService) Now() AssuredNow {
 			}
 		}
 
-		// Propagation error: anchor expired or bound too wide
+		// Propagation error: anchor expired, continuity mismatch, or bound too wide
+		reason := mapPropagationError(err)
 		return AssuredNow{
 			Interval:            nil,
 			Estimate:            &est,
 			SymmetricEpsilon:    nil,
 			Status:              StatusDesync,
-			Reason:              ReasonBoundTooOld,
+			Reason:              reason,
 			AssuranceGeneration: snap.Assurance.Generation,
 			MappingGeneration:   snap.EstimateMapping.MappingGeneration,
 			AssuranceEpochID:    snap.AssuranceEpochID,
@@ -159,6 +161,84 @@ func (s *ClockService) NowUnixProjection() (UnixProjection, error) {
 		return UnixProjection{}, errors.New("estimate unavailable")
 	}
 	return s.leapHistory.GstInstantToUnixProjection(*now.Estimate), nil
+}
+
+// NowPublicAssured returns the public clock's assured presentation view (Section 7.8).
+func (s *ClockService) NowPublicAssured() PublicAssuredNow {
+	reading := s.rawClock.Read()
+	snap := s.publisher.Acquire()
+
+	est, _ := snap.EstimateMapping.Evaluate(reading.Raw)
+	pCenter, _ := s.publicClock.ReadPublicInstant(est, reading.Raw)
+
+	if snap.Assurance.Status == StatusSynced || snap.Assurance.Status == StatusHoldover {
+		inv, err := assurance.PropagateAnchor(
+			snap.Assurance.Anchor,
+			reading.Raw,
+			reading.ReadBound,
+			reading.ContinuityToken,
+			snap.Assurance.LowerDebt,
+			snap.Assurance.UpperDebt,
+			snap.Assurance.MaxAssuranceWidthNs,
+		)
+
+		if err == nil {
+			pubEps := clock.ComputePublicSymmetricEpsilon(pCenter, inv, reading.ReadBound)
+			if pubEps >= PublicEpsilonCapDefault {
+				return PublicAssuredNow{
+					Center:                 pCenter,
+					Interval:               nil,
+					PublicSymmetricEpsilon: pubEps,
+					Status:                 StatusDesync,
+					Reason:                 ReasonPublicBoundTooWide,
+				}
+			}
+
+			return PublicAssuredNow{
+				Center:                 pCenter,
+				Interval:               inv,
+				PublicSymmetricEpsilon: pubEps,
+				Status:                 snap.Assurance.Status,
+				Reason:                 snap.Assurance.Reason,
+			}
+		}
+
+		return PublicAssuredNow{
+			Center:                 pCenter,
+			Interval:               nil,
+			PublicSymmetricEpsilon: ErrorInfinity,
+			Status:                 StatusDesync,
+			Reason:                 mapPropagationError(err),
+		}
+	}
+
+	return PublicAssuredNow{
+		Center:                 pCenter,
+		Interval:               nil,
+		PublicSymmetricEpsilon: ErrorInfinity,
+		Status:                 snap.Assurance.Status,
+		Reason:                 snap.Assurance.Reason,
+	}
+}
+
+func mapPropagationError(err error) StatusReason {
+	if errors.Is(err, assurance.ErrContinuityTokenMismatch) || errors.Is(err, assurance.ErrRawEarlierThanAnchor) {
+		return ReasonRawDiscontinuity
+	}
+	if errors.Is(err, core.ErrOverflow) {
+		return ReasonArithmeticOverflow
+	}
+	return ReasonBoundTooOld
+}
+
+// SetSmearPlan configures the public clock's active smear plan (Section 5.14).
+func (s *ClockService) SetSmearPlan(plan *clock.SmearPlan) {
+	s.publicClock.SetSmearPlan(plan)
+}
+
+// PublicClock returns the underlying PublicClock instance.
+func (s *ClockService) PublicClock() *clock.PublicClock {
+	return s.publicClock
 }
 
 // After implements the tri-state decision operation for t (Section 7.5).
@@ -227,14 +307,21 @@ func (s *ClockService) CommitWait(
 	leapID [32]byte,
 	cfgID [32]byte,
 ) error {
-	for {
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
 		select {
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer timer.Stop()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
 				return ErrDeadlineExceeded
 			}
 			return ErrCancelled
-		default:
 		}
 
 		wm, status, err := s.PastWatermark(epochID, leapID, cfgID)
@@ -249,8 +336,15 @@ func (s *ClockService) CommitWait(
 			return nil // Guaranteed committed strictly after commitTs
 		}
 
-		// Yield or brief wait before re-checking
-		time.Sleep(100 * time.Microsecond)
+		timer.Reset(100 * time.Microsecond)
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return ErrDeadlineExceeded
+			}
+			return ErrCancelled
+		case <-timer.C:
+		}
 	}
 }
 

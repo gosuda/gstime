@@ -3,7 +3,7 @@ package ntp
 import (
 	"sync"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 // Stamp captures the single raw clock read and corresponding evaluated estimate.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/gosuda/gstime/core"
+	"gosuda.org/gstime/core"
 )
 
 var (
@@ -292,15 +292,10 @@ func (ac *AssuranceClock) EvaluateAt(
 		if errors.Is(err, ErrAnchorExpired) || errors.Is(err, ErrBoundTooWide) {
 			return nil, core.StatusDesync, core.ReasonBoundTooOld, err
 		}
-		if errors.Is(err, ErrContinuityTokenMismatch) {
+		if errors.Is(err, ErrContinuityTokenMismatch) || errors.Is(err, ErrRawEarlierThanAnchor) {
 			return nil, core.StatusDesync, core.ReasonRawDiscontinuity, err
 		}
 		return nil, core.StatusDesync, core.ReasonArithmeticOverflow, err
-	}
-
-	// Invariant: update watermark monotonically
-	if interval.Earliest > ac.state.PastWatermark {
-		// Watermark is updated
 	}
 
 	return interval, ac.state.Status, ac.state.Reason, nil
