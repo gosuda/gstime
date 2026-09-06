@@ -21,7 +21,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 
 	// 1. Initial state: UNANCHORED
 	now0 := svc.Now()
-	if now0.Status != StatusUnanchored || now0.Interval != nil {
+	if now0.Status != StatusUnanchored || now0.HasInterval {
 		t.Fatalf("expected UNANCHORED with nil interval, got status=%s, inv=%v", now0.Status, now0.Interval)
 	}
 
@@ -46,10 +46,10 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 
 	// 3. Now in SYNCED state
 	nowSynced := svc.Now()
-	if nowSynced.Status != StatusSynced || nowSynced.Interval == nil {
+	if nowSynced.Status != StatusSynced || !nowSynced.HasInterval {
 		t.Fatalf("expected StatusSynced with non-nil interval")
 	}
-	if nowSynced.SymmetricEpsilon == nil || *nowSynced.SymmetricEpsilon < 50_000 {
+	if !nowSynced.HasSymmetricEpsilon || nowSynced.SymmetricEpsilon < 50_000 {
 		t.Fatalf("expected valid symmetric epsilon, got %v", nowSynced.SymmetricEpsilon)
 	}
 
@@ -296,7 +296,7 @@ func TestClockService_VMSnapshotTimeReversalAndFreeze(t *testing.T) {
 	if nowReversal.Reason != ReasonRawDiscontinuity {
 		t.Fatalf("expected ReasonRawDiscontinuity, got %s", nowReversal.Reason)
 	}
-	if nowReversal.Interval != nil {
+	if nowReversal.HasInterval {
 		t.Fatalf("expected nil interval on raw reversal, got %+v", nowReversal.Interval)
 	}
 

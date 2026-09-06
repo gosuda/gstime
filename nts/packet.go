@@ -35,6 +35,9 @@ type AuthenticatorField struct {
 }
 
 // BuildProtectedRequest creates the complete extension field payload for an NTS-protected NTP request.
+// placeholderCount is an upper bound: optional placeholders are reduced to fit
+// PreferredPacketSize and the RFC inventory target. The mandatory cookie may
+// exceed the preferred budget, but the complete packet never exceeds MaxPacketSize.
 func BuildProtectedRequest(
 	ntpHeader []byte,
 	cookie []byte,
@@ -42,6 +45,13 @@ func BuildProtectedRequest(
 	aead cipher.AEAD,
 	c2sKey []byte,
 ) (extBytes []byte, uniqueID []byte, err error) {
+	if len(ntpHeader) != 48 {
+		return nil, nil, errors.New("NTS requires a 48-byte NTP header")
+	}
+	placeholderCount, err = requestPlaceholderCount(len(cookie), placeholderCount, aead)
+	if err != nil {
+		return nil, nil, err
+	}
 	// 1. Generate fresh Unique Identifier (32 bytes)
 	uniqueID = make([]byte, 32)
 	if _, err := rand.Read(uniqueID); err != nil {
@@ -88,20 +98,12 @@ func BuildProtectedRequest(
 	cipherLen := len(plaintext) + aead.Overhead()
 	rawBodyLen := 2 + 2 + len(nonce) + cipherLen
 	pad := (4 - (rawBodyLen % 4)) % 4
-	totalAuthFieldLen := 4 + rawBodyLen + pad
 
 	// Build Associated Data (AD):
-	// NTP header (48 bytes) || Encoded Pre-Auth Fields || Type(0x0404) || FieldLen || NonceLen || CipherLen
+	// RFC 8915 section 5.6: NTP header || extension fields BEFORE Authenticator.
 	var ad []byte
 	ad = append(ad, ntpHeader...)
 	ad = append(ad, encodedPreAuth...)
-
-	authPrefix := make([]byte, 8)
-	binary.BigEndian.PutUint16(authPrefix[0:2], ExtTypeAuthenticator)
-	binary.BigEndian.PutUint16(authPrefix[2:4], uint16(totalAuthFieldLen))
-	binary.BigEndian.PutUint16(authPrefix[4:6], uint16(len(nonce)))
-	binary.BigEndian.PutUint16(authPrefix[6:8], uint16(cipherLen))
-	ad = append(ad, authPrefix...)
 
 	ciphertext := aead.Seal(nil, nonce, plaintext, ad)
 
@@ -130,6 +132,9 @@ func VerifyAndDecryptResponse(
 	expectedUniqueID []byte,
 	aead cipher.AEAD,
 ) (replenishedCookies [][]byte, err error) {
+	if err := checkResponsePacketSize(ntpHeader, extFields); err != nil {
+		return nil, err
+	}
 	if len(extFields) == 0 {
 		return nil, ErrMissingAuthenticator
 	}
@@ -174,14 +179,13 @@ func VerifyAndDecryptResponse(
 	ciphertext := authWire[8+nonceLen : 8+nonceLen+cipherLen]
 
 	// 4. Construct Associated Data:
-	// NTP header (48 bytes) || Encoded Pre-Auth Fields || Authenticator 8-byte prefix
+	// RFC 8915 section 5.6: NTP header || extension fields BEFORE Authenticator.
 	preAuthFields := extFields[:len(extFields)-1]
 	encodedPreAuth := ntp.EncodeExtensionFields(preAuthFields)
 
 	var ad []byte
 	ad = append(ad, ntpHeader...)
 	ad = append(ad, encodedPreAuth...)
-	ad = append(ad, authWire[:8]...) // Type, Length, NonceLen, CipherLen
 
 	plaintext, err := aead.Open(nil, nonce, ciphertext, ad)
 	if err != nil {
@@ -190,12 +194,19 @@ func VerifyAndDecryptResponse(
 
 	// 5. Decrypted plaintext contains inner extension fields (e.g. New Cookie fields 0x0204)
 	if len(plaintext) > 0 {
-		innerFields, _, err := ntp.ParseExtensionFields(plaintext)
-		if err == nil {
-			for _, inF := range innerFields {
-				if inF.Type == ExtTypeCookie {
-					replenishedCookies = append(replenishedCookies, inF.Value)
+		innerFields, trailing, err := ntp.ParseExtensionFields(plaintext)
+		if err != nil {
+			return nil, fmt.Errorf("malformed encrypted NTS extension fields: %w", err)
+		}
+		if len(trailing) != 0 {
+			return nil, errors.New("trailing bytes in encrypted NTS extension fields")
+		}
+		for _, inF := range innerFields {
+			if inF.Type == ExtTypeCookie {
+				if !validCookieSize(len(inF.Value)) {
+					return nil, ErrInvalidCookie
 				}
+				replenishedCookies = append(replenishedCookies, inF.Value)
 			}
 		}
 	}

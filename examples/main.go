@@ -85,7 +85,7 @@ func main() {
 	// Use Case 2: GSTimeAssure Interval & CommitWait
 	now := svc.Now()
 	fmt.Printf("[UseCase 2: GSTimeAssure Interval & CommitWait]\n")
-	if now.Interval != nil {
+	if now.HasInterval {
 		fmt.Printf("  Interval: [%d, %d]\n", now.Interval.Earliest, now.Interval.Latest)
 		fmt.Printf("  Width:    %d ns\n", now.Interval.Latest-now.Interval.Earliest)
 	}

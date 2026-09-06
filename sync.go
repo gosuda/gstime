@@ -7,11 +7,15 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"gosuda.org/gstime/assurance"
 	"gosuda.org/gstime/clock"
 	"gosuda.org/gstime/config"
 	"gosuda.org/gstime/core"
@@ -20,7 +24,12 @@ import (
 	"gosuda.org/gstime/source"
 )
 
-// SourceQuerier abstracts network interactions for NTP/NTS queries, enabling unit testing without external network.
+// SourceQuerier abstracts network interactions for NTP/NTS queries.
+// Implementations must acquire fresh evidence during this round, on the supplied
+// service raw clock and its current continuity/scale envelope. Cached results
+// from an earlier round or clock generation must not be returned. HardInterval
+// describes GST time at RawMid, not at query completion. RawMidReadBound must
+// bound acquisition error in that raw coordinate (zero explicitly means exact).
 type SourceQuerier interface {
 	QuerySource(ctx context.Context, src config.SourceConfig, rawNow core.RawNanos) (*ntp.MeasurementResult, error)
 }
@@ -63,6 +72,7 @@ type SyncEngine struct {
 	pollIntvl    time.Duration
 	queryTimeout time.Duration
 
+	pollMu  sync.Mutex
 	mu      sync.Mutex
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
@@ -94,7 +104,7 @@ func NewSyncEngine(cfg config.Config, svc *ClockService, opts ...SyncOption) (*S
 	}
 
 	if engine.querier == nil {
-		engine.querier = newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, engine.queryTimeout)
+		engine.querier = newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, svc.leapHistory, engine.queryTimeout)
 	}
 
 	return engine, nil
@@ -167,10 +177,24 @@ func (e *SyncEngine) loop(ctx context.Context) {
 }
 
 // PollOnce executes a single parallel query round across configured sources and publishes consensus.
-func (e *SyncEngine) PollOnce(ctx context.Context) error {
+func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
+	e.pollMu.Lock()
+	defer e.pollMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if e.closed.Load() {
 		return errors.New("sync engine is closed")
 	}
+	defer func() {
+		// Parent cancellation or engine shutdown is not a failed evidence round.
+		// A per-source timeout with a live parent still counts as a failure.
+		if pollErr != nil && ctx.Err() == nil && !e.closed.Load() {
+			pollErr = errors.Join(pollErr, e.svc.markRoundFailure(e.cfg.Assurance.MaxHoldoverAgeNs))
+		}
+	}()
+	startReading := e.svc.rawClock.Read()
+	scaleLow, scaleUpp := e.svc.rawClock.ScaleEnvelope()
 
 	type sourceResult struct {
 		domain string
@@ -196,16 +220,56 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 
 	wg.Wait()
 	close(results)
+	if e.closed.Load() {
+		return errors.New("sync engine is closed")
+	}
 
-	var intervals []core.TimeInterval
-	seenDomains := make(map[string]bool)
-
+	// Every interval must refer to this same reading, not to its individual RawMid.
+	reading := e.svc.rawClock.Read()
+	nowRaw := reading.Raw
+	currentLow, currentUpp := e.svc.rawClock.ScaleEnvelope()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if reading.ContinuityToken != startReading.ContinuityToken || reading.BackendGeneration != startReading.BackendGeneration || nowRaw < startReading.Raw || currentLow != scaleLow || currentUpp != scaleUpp {
+		return errors.New("raw clock changed during query round")
+	}
+	maxAge := e.cfg.Assurance.MaxAgeNs
+	if maxAge <= 0 {
+		maxAge = 10 * 1_000_000_000
+	}
+	if uint64(nowRaw) > math.MaxUint64-uint64(maxAge) {
+		return core.ErrOverflow
+	}
+	byDomain := make(map[string][]core.TimeInterval)
 	for r := range results {
-		if r.err == nil && r.res != nil {
-			if !seenDomains[r.domain] {
-				seenDomains[r.domain] = true
-				intervals = append(intervals, r.res.HardInterval)
-			}
+		if r.err != nil || r.res == nil || r.domain == "" {
+			continue
+		}
+		if r.res.RawMid < startReading.Raw || r.res.RawMid > nowRaw || nowRaw-r.res.RawMid > core.RawNanos(maxAge) {
+			continue
+		}
+		sample := &assurance.AssuranceAnchor{
+			RawAnchor: r.res.RawMid, LowerAtAnchor: r.res.HardInterval.Earliest, UpperAtAnchor: r.res.HardInterval.Latest,
+			RawScaleLower: scaleLow, RawScaleUpper: scaleUpp, RawReadBound: r.res.RawMidReadBound,
+			ContinuityToken: reading.ContinuityToken, ValidUntilRaw: nowRaw,
+		}
+		inv, err := assurance.PropagateAnchor(sample, nowRaw, reading.ReadBound, reading.ContinuityToken, 0, 0, e.cfg.Assurance.MaxWidthNs)
+		if err != nil {
+			continue
+		}
+		byDomain[r.domain] = append(byDomain[r.domain], inv)
+	}
+	var domains []string
+	for domain := range byDomain {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	var intervals []core.TimeInterval
+	for _, domain := range domains {
+		consolidated := source.ConsolidateDomainIntervals(core.FaultDomainID(domain), byDomain[domain])
+		if !consolidated.Inconsistent {
+			intervals = append(intervals, consolidated.Interval)
 		}
 	}
 
@@ -214,8 +278,8 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		minDomains = 1
 	}
 
-	if len(seenDomains) < minDomains {
-		return fmt.Errorf("insufficient voting domains: got %d, required %d", len(seenDomains), minDomains)
+	if len(intervals) < minDomains {
+		return fmt.Errorf("insufficient voting domains: got %d, required %d", len(intervals), minDomains)
 	}
 
 	faultBudget := e.cfg.Assurance.FaultBudget
@@ -236,27 +300,8 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 		return fmt.Errorf("consensus computation failed: %w", err)
 	}
 
-	reading := e.svc.rawClock.Read()
-	nowRaw := reading.Raw
-	center := (consensus.Hull.Earliest + consensus.Hull.Latest) / 2
-
-	maxAge := e.cfg.Assurance.MaxAgeNs
-	if maxAge <= 0 {
-		maxAge = 10 * 1_000_000_000
-	}
 	validUntilRaw := nowRaw + core.RawNanos(maxAge)
-
-	_ = e.svc.InitializeEstimate(nowRaw, center, 0)
-
-	err = e.svc.PublishAssuranceRound(
-		nowRaw,
-		consensus.Hull,
-		uint32(faultBudget),
-		uint32(len(seenDomains)),
-		uint32(minHonest),
-		uint32(len(consensus.Components)),
-		validUntilRaw,
-	)
+	err = e.svc.publishSyncRound(reading, scaleLow, scaleUpp, consensus, validUntilRaw)
 	if err != nil {
 		return fmt.Errorf("failed to publish assurance round: %w", err)
 	}
@@ -265,27 +310,30 @@ func (e *SyncEngine) PollOnce(ctx context.Context) error {
 }
 
 type defaultSourceQuerier struct {
-	rawClock clock.RawClock
-	estClock *clock.EstimateClock
-	timeout  time.Duration
-	ntsMu    sync.Mutex
-	ntsState map[string]*ntsSession
+	rawClock    clock.RawClock
+	estClock    *clock.EstimateClock
+	leapHistory *core.LeapHistory
+	timeout     time.Duration
+	ntsMu       sync.Mutex
+	ntsState    map[string]*ntsSession
 }
 
 type ntsSession struct {
-	c2sKey  []byte
-	s2cKey  []byte
-	c2sAead cipher.AEAD
-	s2cAead cipher.AEAD
-	jar     *nts.CookieJar
+	udpEndpoint string
+	c2sKey      []byte
+	s2cKey      []byte
+	c2sAead     cipher.AEAD
+	s2cAead     cipher.AEAD
+	jar         *nts.CookieJar
 }
 
-func newDefaultSourceQuerier(rc clock.RawClock, ec *clock.EstimateClock, timeout time.Duration) *defaultSourceQuerier {
+func newDefaultSourceQuerier(rc clock.RawClock, ec *clock.EstimateClock, lh *core.LeapHistory, timeout time.Duration) *defaultSourceQuerier {
 	return &defaultSourceQuerier{
-		rawClock: rc,
-		estClock: ec,
-		timeout:  timeout,
-		ntsState: make(map[string]*ntsSession),
+		rawClock:    rc,
+		estClock:    ec,
+		leapHistory: lh,
+		timeout:     timeout,
+		ntsState:    make(map[string]*ntsSession),
 	}
 }
 
@@ -294,6 +342,23 @@ func (q *defaultSourceQuerier) QuerySource(ctx context.Context, src config.Sourc
 		return q.queryNTS(ctx, src)
 	}
 	return q.queryNTP(ctx, src.Endpoint)
+}
+
+// localUnixEstimate applies the same leap policy and wall-clock fallback to
+// send and receive readings in both acquisition transports.
+func (q *defaultSourceQuerier) localUnixEstimate(raw core.RawNanos) (int64, error) {
+	var unix int64
+	if q.estClock != nil {
+		snap := q.estClock.Snapshot()
+		if est, err := snap.Evaluate(raw); err == nil && est > 0 {
+			projection := q.leapHistory.GstInstantToUnixProjection(est)
+			if projection.IsLeapSecond {
+				return 0, errors.New("local estimate is in a leap second")
+			}
+			unix = int64(projection.Nanos)
+		}
+	}
+	return cmp.Or(unix, time.Now().UnixNano()), nil
 }
 
 func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*ntp.MeasurementResult, error) {
@@ -318,15 +383,10 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	reqBytes := req.Encode()
 
 	r1 := q.rawClock.Read()
-	t1Raw := r1.Raw
-	var t1Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			t1Unix = int64(est)
-		}
+	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
 
 	_, err = conn.Write(reqBytes)
 	if err != nil {
@@ -340,15 +400,10 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 	}
 
 	r4 := q.rawClock.Read()
-	t4Raw := r4.Raw
-	var t4Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			t4Unix = int64(est)
-		}
+	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
 
 	resp, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
@@ -359,38 +414,7 @@ func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*
 		return nil, fmt.Errorf("kiss-of-death received: %s", code)
 	}
 
-	coarseSec := time.Now().Unix()
-	t2Unix, err := ntp.UnfoldTimestamp(resp.RecvTimestamp, coarseSec)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T2: %w", err)
-	}
-	t3Unix, err := ntp.UnfoldTimestamp(resp.TxTimestamp, coarseSec)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T3: %w", err)
-	}
-
-	measIn := ntp.MeasurementInput{
-		LocalSendRaw:                t1Raw,
-		LocalRecvRaw:                t4Raw,
-		T1LocalSendEstimate:         core.GstInstant(t1Unix),
-		T2ServerRecv:                core.GstInstant(t2Unix),
-		T3ServerTx:                  core.GstInstant(t3Unix),
-		T4LocalRecvEstimate:         core.GstInstant(t4Unix),
-		LocalEstimateAtMid:          core.GstInstant(t1Unix + (t4Unix-t1Unix)/2),
-		ServerRootDelayNs:           resp.RootDelayNanoseconds(),
-		ServerRootDispersionNs:      resp.RootDispersionNanoseconds(),
-		LocalSendReadError:          core.ErrorNs(r1.ReadBound),
-		LocalRecvReadError:          core.ErrorNs(r4.ReadBound),
-		RemoteTimestampQuantization: 1000,
-		LocalMappingIntegrationErr:  1000,
-		StaticAsymmetryCorrection:   0,
-		StaticAsymmetryUncertainty:  0,
-		PrecisionFloorNs:            1000,
-		MaxServerTurnaroundNs:       2_000_000_000,
-		MaxRootDistanceNs:           16_000_000_000,
-	}
-
-	return ntp.ComputeMeasurement(measIn)
+	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
 }
 
 func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceConfig) (*ntp.MeasurementResult, error) {
@@ -413,9 +437,7 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	}
 
 	d := net.Dialer{Timeout: q.timeout}
-	host, _, _ := net.SplitHostPort(src.Endpoint)
-	host = cmp.Or(host, src.Endpoint)
-	udpEndpoint := net.JoinHostPort(host, "123")
+	udpEndpoint := sess.udpEndpoint
 
 	conn, err := d.DialContext(ctx, "udp", udpEndpoint)
 	if err != nil {
@@ -445,25 +467,25 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	fullPacket := append(headerBytes, extBytes...)
 
 	r1 := q.rawClock.Read()
-	t1Raw := r1.Raw
-	var t1Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t1Raw); err == nil && est > 0 {
-			t1Unix = int64(est)
-		}
+	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t1Unix = cmp.Or(t1Unix, time.Now().UnixNano())
 
 	_, err = conn.Write(fullPacket)
 	if err != nil {
 		return nil, err
 	}
 
-	buf := make([]byte, 2048)
+	// One extra byte prevents accepting a valid-looking prefix of an oversized
+	// datagram. The buffer covers authenticated replacement cookies as well.
+	buf := make([]byte, nts.MaxPacketSize+1)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err
+	}
+	if n > nts.MaxPacketSize {
+		return nil, nts.ErrPacketTooLarge
 	}
 
 	if n < 48 {
@@ -471,15 +493,10 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 	}
 
 	r4 := q.rawClock.Read()
-	t4Raw := r4.Raw
-	var t4Unix int64
-	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(t4Raw); err == nil && est > 0 {
-			t4Unix = int64(est)
-		}
+	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	if err != nil {
+		return nil, err
 	}
-	t4Unix = cmp.Or(t4Unix, time.Now().UnixNano())
 
 	resp, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
@@ -500,6 +517,14 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		sess.jar.AddCookies(newCookies)
 	}
 
+	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
+}
+
+func (q *defaultSourceQuerier) measureResponse(resp *ntp.Packet, r1, r4 clock.RawReading, t1Unix, t4Unix int64) (*ntp.MeasurementResult, error) {
+	t1Raw, t4Raw := r1.Raw, r4.Raw
+	if resp.Version != 4 || resp.Mode != 4 || resp.Stratum < 1 || resp.Stratum > 15 || resp.LeapIndicator != 0 {
+		return nil, errors.New("unsupported, unsynchronized, or leap-announcing NTP response")
+	}
 	coarseSec := time.Now().Unix()
 	t2Unix, err := ntp.UnfoldTimestamp(resp.RecvTimestamp, coarseSec)
 	if err != nil {
@@ -510,6 +535,9 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		return nil, fmt.Errorf("failed to unfold T3: %w", err)
 	}
 
+	if err := q.checkUnixInterval(t2Unix, t3Unix); err != nil {
+		return nil, err
+	}
 	measIn := ntp.MeasurementInput{
 		LocalSendRaw:                t1Raw,
 		LocalRecvRaw:                t4Raw,
@@ -531,92 +559,105 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		MaxRootDistanceNs:           16_000_000_000,
 	}
 
-	return ntp.ComputeMeasurement(measIn)
+	m, err := ntp.ComputeMeasurement(measIn)
+	if err != nil {
+		return nil, err
+	}
+	if err := q.checkUnixInterval(int64(m.HardInterval.Earliest), int64(m.HardInterval.Latest)); err != nil {
+		return nil, err
+	}
+	lo, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Earliest))
+	if err != nil {
+		return nil, err
+	}
+	hi, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Latest))
+	if err != nil {
+		return nil, err
+	}
+	center, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.Center))
+	if err != nil {
+		return nil, err
+	}
+	m.HardInterval = core.TimeInterval{Earliest: lo, Latest: hi}
+	m.Center = center
+	return m, nil
+}
+
+// Only unsmeared UTC/NTP sources are supported. Reject intervals crossing the
+// repeated/deleted second or the first second of a recorded transition; the wire
+// timestamps and LI field do not establish a unique SI interpretation there.
+func (q *defaultSourceQuerier) checkUnixInterval(lo, hi int64) error {
+	if lo > hi {
+		return core.ErrInvalidRange
+	}
+	first, last := core.FloorDiv(lo, 1_000_000_000), core.FloorDiv(hi, 1_000_000_000)
+	for _, e := range q.leapHistory.Entries {
+		if e.TransitionUnixSecond != math.MinInt64 && first <= e.TransitionUnixSecond && last >= e.TransitionUnixSecond-1 {
+			return errors.New("NTP interval crosses an ambiguous leap boundary")
+		}
+	}
+	return nil
 }
 
 func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint string) (*ntsSession, error) {
 	host, port, _ := net.SplitHostPort(endpoint)
 	host = cmp.Or(host, endpoint)
 	port = cmp.Or(port, "4460")
-	keAddr := net.JoinHostPort(host, port)
-
-	dialer := &net.Dialer{Timeout: q.timeout}
-	tlsConfig := &tls.Config{
-		NextProtos: []string{"ntske/1"},
-		ServerName: host,
+	timeout := q.timeout
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
 	}
-
-	conn, err := tls.DialWithDialer(dialer, "tcp", keAddr, tlsConfig)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: timeout}, Config: &tls.Config{
+		MinVersion: tls.VersionTLS13, NextProtos: []string{"ntske/1"}, ServerName: host,
+	}}
+	connection, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
+	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(q.timeout))
+		_ = connection.SetDeadline(deadline)
 	}
-
-	req := nts.BuildClientRequest([]uint16{15, 30}, true)
-	if _, err := conn.Write(req); err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 8192)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	records, err := nts.ParseRecords(buf[:n], 16*1024)
-	if err != nil {
-		return nil, err
-	}
-
-	var cookies [][]byte
-	var aeadID uint16 = 15
-
-	for _, rec := range records {
-		switch rec.Type {
-		case 3:
-			if len(rec.Body) > 0 {
-				cookies = append(cookies, rec.Body)
-			}
-		case 4:
-			if len(rec.Body) >= 2 {
-				aeadID = uint16(rec.Body[0])<<8 | uint16(rec.Body[1])
-			}
-		}
-	}
-
-	if len(cookies) == 0 {
-		return nil, errors.New("no NTS cookies returned by server")
-	}
-
+	conn := connection.(*tls.Conn)
 	cs := conn.ConnectionState()
-	c2sKey, s2cKey, err := nts.ExportDirectionalKeys(cs.ExportKeyingMaterial, 0, aeadID)
+	if cs.NegotiatedProtocol != "ntske/1" {
+		return nil, errors.New("NTS-KE ALPN was not negotiated")
+	}
+	offered := []uint16{15, 30}
+	if _, err := conn.Write(nts.BuildClientRequest(offered, true)); err != nil {
+		return nil, err
+	}
+	response, err := nts.ReadServerResponse(conn, offered)
+	if err != nil {
+		return nil, err
+	}
+	c2sKey, s2cKey, err := nts.ExportDirectionalKeys(cs.ExportKeyingMaterial, 0, response.AEAD)
 	if err != nil {
 		return nil, fmt.Errorf("failed to export NTS directional keys: %w", err)
 	}
-
-	c2sAead, err := nts.NewAEAD(aeadID, c2sKey)
+	c2sAead, err := nts.NewAEAD(response.AEAD, c2sKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct C2S AEAD: %w", err)
+		return nil, err
 	}
-	s2cAead, err := nts.NewAEAD(aeadID, s2cKey)
+	s2cAead, err := nts.NewAEAD(response.AEAD, s2cKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct S2C AEAD: %w", err)
+		return nil, err
 	}
-
+	udpHost := response.ServerName
+	if udpHost == "" {
+		udpHost, _, err = net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			return nil, err
+		}
+	}
 	jar := nts.NewCookieJar()
-	jar.AddCookies(cookies)
-
-	return &ntsSession{
-		c2sKey:  c2sKey,
-		s2cKey:  s2cKey,
-		c2sAead: c2sAead,
-		s2cAead: s2cAead,
-		jar:     jar,
-	}, nil
+	if jar.AddCookies(response.Cookies) == 0 {
+		return nil, errors.New("NTS-KE supplied no usable cookies")
+	}
+	return &ntsSession{c2sKey: c2sKey, s2cKey: s2cKey, c2sAead: c2sAead, s2cAead: s2cAead, jar: jar,
+		udpEndpoint: net.JoinHostPort(udpHost, strconv.Itoa(int(response.Port)))}, nil
 }

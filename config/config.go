@@ -83,6 +83,9 @@ func (c *Config) Validate() error {
 	if c.Assurance.MinHonestCoverage < 1 {
 		return fmt.Errorf("%w: minHonestCoverage must be >= 1", ErrInvalidConfig)
 	}
+	if c.Assurance.MaxAgeNs < 0 || c.Assurance.MaxHoldoverAgeNs < 0 {
+		return fmt.Errorf("%w: age limits cannot be negative", ErrInvalidConfig)
+	}
 	if c.Assurance.MaxWidthNs <= 0 {
 		return fmt.Errorf("%w: maxWidthNs must be positive", ErrInvalidConfig)
 	}

@@ -3,6 +3,7 @@ package assurance
 import (
 	"crypto/rand"
 	"errors"
+	"math"
 	"sync"
 
 	"gosuda.org/gstime/core"
@@ -59,22 +60,31 @@ func PropagateAnchor(
 	lowerDebt core.DurationNs,
 	upperDebt core.DurationNs,
 	maxAssuranceWidthNs int64,
-) (*core.TimeInterval, error) {
+) (core.TimeInterval, error) {
 	if anchor == nil {
-		return nil, errors.New("no anchor available")
+		return core.TimeInterval{}, errors.New("no anchor available")
 	}
 	if r < anchor.RawAnchor {
-		return nil, ErrRawEarlierThanAnchor
+		return core.TimeInterval{}, ErrRawEarlierThanAnchor
 	}
 	if r > anchor.ValidUntilRaw {
-		return nil, ErrAnchorExpired
+		return core.TimeInterval{}, ErrAnchorExpired
 	}
 	if continuityToken != anchor.ContinuityToken {
-		return nil, ErrContinuityTokenMismatch
+		return core.TimeInterval{}, ErrContinuityTokenMismatch
 	}
 
+	if anchor.RawScaleLower <= 0 || anchor.RawScaleUpper < anchor.RawScaleLower {
+		return core.TimeInterval{}, core.ErrInvalidRange
+	}
 	dr := r - anchor.RawAnchor
+	if uint64(anchor.RawReadBound) > math.MaxUint64-uint64(currentRawReadBound) {
+		return core.TimeInterval{}, core.ErrOverflow
+	}
 	rawDeltaError := uint64(anchor.RawReadBound) + uint64(currentRawReadBound)
+	if uint64(dr) > math.MaxInt64 || rawDeltaError > uint64(math.MaxInt64)-uint64(dr) {
+		return core.TimeInterval{}, core.ErrOverflow
+	}
 
 	var drLo uint64
 	if uint64(dr) > rawDeltaError {
@@ -84,29 +94,59 @@ func PropagateAnchor(
 
 	advanceLo, err := core.MulScaleDurationFloor(anchor.RawScaleLower, core.RawNanos(drLo))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 	advanceHi, err := core.MulScaleDurationCeil(anchor.RawScaleUpper, core.RawNanos(drHi))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 
-	L := anchor.LowerAtAnchor + core.GstInstant(advanceLo) + core.GstInstant(lowerDebt)
-	U := anchor.UpperAtAnchor + core.GstInstant(advanceHi) + core.GstInstant(upperDebt)
+	L, err := checkedInstantAdd(anchor.LowerAtAnchor, advanceLo, int64(lowerDebt))
+	if err != nil {
+		return core.TimeInterval{}, err
+	}
+	U, err := checkedInstantAdd(anchor.UpperAtAnchor, advanceHi, int64(upperDebt))
+	if err != nil {
+		return core.TimeInterval{}, err
+	}
 
 	if L > U {
-		return nil, core.ErrInvalidRange
+		return core.TimeInterval{}, core.ErrInvalidRange
 	}
 
+	if L < 0 && U > core.GstInstant(math.MaxInt64)+L {
+		return core.TimeInterval{}, core.ErrOverflow
+	}
 	width := int64(U - L)
 	if maxAssuranceWidthNs > 0 && width >= maxAssuranceWidthNs {
-		return nil, ErrBoundTooWide
+		return core.TimeInterval{}, ErrBoundTooWide
 	}
 
-	return &core.TimeInterval{
+	return core.TimeInterval{
 		Earliest: L,
 		Latest:   U,
 	}, nil
+}
+
+func checkedInstantAdd(base core.GstInstant, terms ...int64) (core.GstInstant, error) {
+	v := int64(base)
+	for _, d := range terms {
+		if willTermOverflow(v, d) {
+			return 0, core.ErrOverflow
+		}
+		v += d
+	}
+	return core.GstInstant(v), nil
+}
+
+func willTermOverflow(v, d int64) bool {
+	if d > 0 {
+		return v > math.MaxInt64-d
+	}
+	if d < 0 {
+		return v < math.MinInt64-d
+	}
+	return false
 }
 
 // AssuranceClock manages the synchronization state machine and certified bounds.
@@ -142,6 +182,18 @@ func (ac *AssuranceClock) Snapshot() AssuranceState {
 	return ac.state
 }
 
+// ValidateHull checks ordering and the full width without signed subtraction.
+// Call before changing any assurance, estimate, or publication state.
+func ValidateHull(hull core.TimeInterval, maxWidthNs int64) error {
+	if hull.Earliest > hull.Latest || maxWidthNs <= 0 {
+		return core.ErrInvalidRange
+	}
+	if uint64(hull.Latest)-uint64(hull.Earliest) >= uint64(maxWidthNs) {
+		return ErrBoundTooWide
+	}
+	return nil
+}
+
 // ProcessFullRound integrates a newly computed consensus hull with existing state (Sections 6.4, 6.7).
 func (ac *AssuranceClock) ProcessFullRound(
 	rSel core.RawNanos,
@@ -161,14 +213,14 @@ func (ac *AssuranceClock) ProcessFullRound(
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 
+	if err := ValidateHull(hull, ac.state.MaxAssuranceWidthNs); err != nil {
+		return nil, err
+	}
 	publishedInterval := hull
 
 	// If an existing valid anchor exists on matching domains, compute intersection
 	if ac.state.Status == core.StatusSynced || ac.state.Status == core.StatusHoldover {
-		if ac.state.Anchor != nil &&
-			ac.state.Anchor.LeapHistoryID == leapHistoryID &&
-			ac.state.Anchor.ConfigID == configID &&
-			ac.state.Anchor.ContinuityToken == continuityToken {
+		if isAnchorMatching(ac.state.Anchor, leapHistoryID, configID, continuityToken, scaleLower, scaleUpper) {
 
 			oldPropagated, err := PropagateAnchor(
 				ac.state.Anchor,
@@ -245,14 +297,28 @@ func (ac *AssuranceClock) ProcessFullRound(
 
 // TransitionToHoldover marks the transition from SYNCED to HOLDOVER when round unavailable.
 func (ac *AssuranceClock) TransitionToHoldover(reason core.StatusReason) {
+	ac.BeginHoldover(reason, 0)
+}
+
+// BeginHoldover limits continued use from the last successful selection, never
+// from a repeated failure. A cap may shorten, but never extend, anchor validity.
+func (ac *AssuranceClock) BeginHoldover(reason core.StatusReason, maxAge core.RawNanos) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
-
-	if ac.state.Status == core.StatusSynced {
-		ac.state.Status = core.StatusHoldover
-		ac.state.Reason = reason
-		ac.state.Generation++
+	if ac.state.Status != core.StatusSynced && ac.state.Status != core.StatusHoldover {
+		return
 	}
+	if maxAge > 0 && uint64(ac.state.LastSuccessfulRoundRaw) <= math.MaxUint64-uint64(maxAge) {
+		limit := ac.state.LastSuccessfulRoundRaw + maxAge
+		if ac.state.Anchor != nil && limit < ac.state.Anchor.ValidUntilRaw {
+			anchor := *ac.state.Anchor // published snapshots must remain immutable
+			anchor.ValidUntilRaw = limit
+			ac.state.Anchor = &anchor
+		}
+	}
+	ac.state.Status = core.StatusHoldover
+	ac.state.Reason = reason
+	ac.state.Generation++
 }
 
 // TransitionToDesync marks unrecoverable fault or cap expiration.
@@ -271,12 +337,12 @@ func (ac *AssuranceClock) EvaluateAt(
 	r core.RawNanos,
 	currentRawReadBound core.ErrorNs,
 	continuityToken uint64,
-) (*core.TimeInterval, core.SyncStatus, core.StatusReason, error) {
+) (core.TimeInterval, core.SyncStatus, core.StatusReason, error) {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
 
 	if ac.state.Status == core.StatusUnanchored || ac.state.Status == core.StatusDesync {
-		return nil, ac.state.Status, ac.state.Reason, nil
+		return core.TimeInterval{}, ac.state.Status, ac.state.Reason, nil
 	}
 
 	interval, err := PropagateAnchor(
@@ -290,13 +356,26 @@ func (ac *AssuranceClock) EvaluateAt(
 	)
 	if err != nil {
 		if errors.Is(err, ErrAnchorExpired) || errors.Is(err, ErrBoundTooWide) {
-			return nil, core.StatusDesync, core.ReasonBoundTooOld, err
+			return core.TimeInterval{}, core.StatusDesync, core.ReasonBoundTooOld, err
 		}
 		if errors.Is(err, ErrContinuityTokenMismatch) || errors.Is(err, ErrRawEarlierThanAnchor) {
-			return nil, core.StatusDesync, core.ReasonRawDiscontinuity, err
+			return core.TimeInterval{}, core.StatusDesync, core.ReasonRawDiscontinuity, err
 		}
-		return nil, core.StatusDesync, core.ReasonArithmeticOverflow, err
+		return core.TimeInterval{}, core.StatusDesync, core.ReasonArithmeticOverflow, err
 	}
 
 	return interval, ac.state.Status, ac.state.Reason, nil
+}
+
+func isAnchorMatching(anchor *AssuranceAnchor, leapID, cfgID [32]byte, token uint64, low, upp core.RateScale) bool {
+	if anchor == nil {
+		return false
+	}
+	if anchor.LeapHistoryID != leapID || anchor.ConfigID != cfgID {
+		return false
+	}
+	if anchor.ContinuityToken != token {
+		return false
+	}
+	return anchor.RawScaleLower == low && anchor.RawScaleUpper == upp
 }

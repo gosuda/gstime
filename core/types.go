@@ -136,9 +136,12 @@ type TimeInterval struct {
 
 // AssuredNow contains the published state evaluated at a single raw reading.
 type AssuredNow struct {
-	Interval            *TimeInterval
-	Estimate            *GstInstant
-	SymmetricEpsilon    *ErrorNs
+	Interval            TimeInterval
+	HasInterval         bool
+	Estimate            GstInstant
+	HasEstimate         bool
+	SymmetricEpsilon    ErrorNs
+	HasSymmetricEpsilon bool
 	Status              SyncStatus
 	Reason              StatusReason
 	AssuranceGeneration Generation
@@ -154,7 +157,8 @@ type AssuredNow struct {
 // PublicAssuredNow represents the public clock's assured presentation view.
 type PublicAssuredNow struct {
 	Center                 GstInstant
-	Interval               *TimeInterval
+	Interval               TimeInterval
+	HasInterval            bool
 	PublicSymmetricEpsilon ErrorNs
 	Status                 SyncStatus
 	Reason                 StatusReason

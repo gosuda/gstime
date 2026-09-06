@@ -364,7 +364,7 @@ func TestP14_DesyncReturnsNoFiniteAssuredInterval(t *testing.T) {
 
 	// In UNANCHORED
 	nowUnanchored := svc.Now()
-	if nowUnanchored.Interval != nil {
+	if nowUnanchored.HasInterval {
 		t.Fatalf("P14 violation: UNANCHORED returned finite interval: %+v", nowUnanchored.Interval)
 	}
 
@@ -381,10 +381,10 @@ func TestP14_DesyncReturnsNoFiniteAssuredInterval(t *testing.T) {
 	if nowDesync.Status != core.StatusDesync {
 		t.Fatalf("expected StatusDesync, got %s", nowDesync.Status)
 	}
-	if nowDesync.Interval != nil {
-		t.Fatalf("P14 violation: DESYNC returned non-nil interval: %+v", nowDesync.Interval)
+	if nowDesync.HasInterval {
+		t.Fatalf("P14 violation: DESYNC returned finite interval: %+v", nowDesync.Interval)
 	}
-	if nowDesync.SymmetricEpsilon != nil {
+	if nowDesync.HasSymmetricEpsilon {
 		t.Fatalf("P14 violation: DESYNC returned non-nil symmetric epsilon")
 	}
 }

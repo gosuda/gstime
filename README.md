@@ -15,28 +15,27 @@ go get gosuda.org/gstime
 GSTime supports NTS-KE authenticated endpoints and standard NTPv4 pools across independent failure domains ($N \ge 2F+1$):
 
 ```go
-cfg := config.Config{
-	Assurance: config.AssuranceConfig{
-		FaultBudget:       1,
-		MinVotingDomains:  3,
-		MinHonestCoverage: 2,
-		MaxWidthNs:        32 * 1_000_000_000,
-	},
-	Raw: config.RawConfig{
-		BackendProfile: "standard_monotonic",
-		ScaleLowerPpm:  -200.0,
-		ScaleUpperPpm:  200.0,
-		ReadBoundNs:    1000,
-	},
-	Sources: []config.SourceConfig{
-		{FaultDomainID: "cloudflare", Endpoint: "time.cloudflare.com:4460", NTS: true},
-		{FaultDomainID: "google",     Endpoint: "time.google.com:123",      NTS: false},
-		{FaultDomainID: "apple",      Endpoint: "time.apple.com:123",       NTS: false},
-		{FaultDomainID: "meta",       Endpoint: "time.facebook.com:123",    NTS: false},
-	},
+cfg := config.DefaultConfig()
+cfg.Sources = []config.SourceConfig{
+    {FaultDomainID: "cloudflare", Endpoint: "time.cloudflare.com:4460", NTS: true},
+    // Replace these example endpoints with independent, unsmeared UTC sources.
+    {FaultDomainID: "provider-a", Endpoint: "ntp-a.example.net:123"},
+    {FaultDomainID: "provider-b", Endpoint: "ntp-b.example.net:123"},
 }
-cfgID, _ := cfg.ConfigID()
+cfgID, err := cfg.ConfigID()
+if err != nil { log.Fatal(err) }
 ```
+
+## Assurance assumptions and failure policy
+
+- All source intervals are propagated from their `RawMid` to one selection reading with outward-rounded scale bounds before consensus. Custom `SourceQuerier` implementations must populate `MeasurementResult.RawMidReadBound` with the acquisition raw-coordinate error (zero asserts an exact reference) and acquire fresh evidence within the current round and clock generation; older cached samples without continuity metadata are rejected. Every eligible endpoint in a fault domain is intersected; internally inconsistent domains abstain. Only the remaining domains count toward quorum.
+- NTP/NTS inputs must use **unsmeared UTC**. Smeared sources (including public services that smear by default) are not interchangeable with this profile. Provision and keep the leap history current. Wire timestamps and local estimates are converted explicitly between POSIX and the GST continuous timeline.
+- This implementation conservatively rejects leap announcements (`LI != 0`) and intervals touching or crossing the one-second window on either side of a configured leap transition. It does not guess the branch of a repeated/deleted second. Such sources abstain; this intentionally trades availability for a defined conversion policy.
+- A completed failed evidence round changes a valid anchor from `SYNCED` to `HOLDOVER`. Its deadline is the earlier of the existing `MaxAgeNs` horizon and `LastSuccessfulRoundRaw + MaxHoldoverAgeNs`; failed polls never renew it. A zero holdover limit preserves the existing anchor horizon. Expiry or a detected continuity fault yields `DESYNC`. A fresh valid round can recover synchronization. Parent-context cancellation and engine shutdown do not count as failed rounds; per-source timeouts under a live parent do.
+- Publication requires the full consensus hull's width to be strictly below the configured maximum, consistently with read-time propagation, and validates its ordering before changing the anchor, watermark, estimate, or snapshot. Signed-limit intervals are checked without overflowing their width or midpoint.
+- `PastWatermark` and `CommitWait` require a currently valid anchor. A cached historical watermark is not exposed as currently `SYNCED` after expiry or discontinuity.
+- NTS authenticates the server and packets; it does not establish the server's time accuracy or failure-domain independence. The KE reader requires a complete validated End-of-Message and a bounded message (64 KiB including record headers), without an independent 16 KiB record restriction. The parser, cookie jar, and packet builder share a cookie-size limit derived from the 65,507-byte UDP payload ceiling. Optional cookie placeholders are capped at seven and budgeted toward a 1,232-byte payload; a larger mandatory cookie can still require IP fragmentation and fail on some paths. Responses exceeding the hard payload limit are rejected rather than processed as a truncated prefix. It honors the negotiated NTP host/UDP port and requires TLS 1.3 with `ntske/1` ALPN.
+- Simulation and loopback interoperability tests are not a proof of containment on arbitrary hardware, hypervisors, or public time services.
 
 ## Minimal Examples by Use Case
 
@@ -44,7 +43,9 @@ cfgID, _ := cfg.ConfigID()
 
 ```go
 rawClock := clock.NewSystemRawClock()
-leapHistory, _ := core.NewLeapHistory(10, nil) // Configured GSTL1 leap table
+// leapTableBytes must contain a complete, authoritative GSTL1 leap history.
+leapHistory, err := core.ParseLeapHistory(leapTableBytes)
+if err != nil { log.Fatal(err) }
 svc := gstime.NewClockService(rawClock, leapHistory, cfgID, 32_000_000_000)
 
 // Start background NTP/NTS synchronization engine
@@ -65,7 +66,7 @@ _ = engine.WaitSync(ctx)
 
 ### 1. PublicClock: Monotonic Presentation Time
 
-For logging, APIs, and metrics. Guaranteed strictly non-decreasing ($P_{k+1} \ge P_k$) under OS clock steps, DST transitions, and VM snapshot rollbacks.
+For logging, APIs, and metrics. The published value is non-decreasing ($P_{k+1} \ge P_k$) while the process and its high-watermark state survive. This includes OS wall-clock steps and raw regressions observed by the process, but **not full VM memory rollback**.
 
 ```go
 pub := svc.NowPublicAssured()
@@ -81,7 +82,7 @@ For distributed databases requiring external consistency via certified interval 
 
 ```go
 now := svc.Now()
-if now.Interval != nil {
+if now.HasInterval {
 	// Certified interval [Earliest, Latest] enclosing true SI time
 	fmt.Printf("Certified Range: [%d, %d]\n", now.Interval.Earliest, now.Interval.Latest)
 }
@@ -133,12 +134,15 @@ if status != gstime.StatusSynced || decision != gstime.CertainNo {
 
 ### 6. VM Migration & Discontinuity Fail-Fast
 
-Hardware counters detect suspend/resume and snapshot rollbacks, transitioning to `StatusDesync`.
+`ClockService` wraps its backend in a `ContinuityGuard`: an observed raw regression (including one still above the anchor), token change, or backend-generation change invalidates the old interval. Expiry also produces `StatusDesync` across `Now`, `NowPublicAssured`, `PastWatermark`, and `CommitWait`.
+
+The portable `SystemRawClock` uses `time.Since` and **does not promise to include suspend time** (`IncludesSuspend() == false`). Its rate/read bounds are deployment assumptions, not hardware attestation. Neither it nor the in-memory guard can detect every pause, unobserved regression, or full VM memory restore. Stop polling and call `svc.Invalidate()` from a trusted resume/migration hook before serving time again; obtain a fresh round before resuming assured operations. Use a platform backend with appropriate suspend/continuity support when such hooks are unavailable. Cross-restore monotonicity needs external durable state, not just a process-local clamp.
 
 ```go
 now := svc.Now()
 if now.Status == gstime.StatusDesync {
-	// Reason: ReasonBoundTooOld (VM paused) or ReasonRawDiscontinuity (snapshot rollback)
+	// ReasonBoundTooOld: elapsed-time horizon exceeded.
+	// ReasonRawDiscontinuity: observed raw/token/generation discontinuity.
 }
 ```
 
@@ -159,11 +163,11 @@ go run ./examples/main.go
 ### Deterministic Simulation Testing (DST)
 
 GSTime includes a deterministic simulation testing (DST) harness (`dst_test.go`) inspired by FoundationDB and Antithesis. It runs discrete time simulation with pseudorandom fault injection across PRNG seeds:
-- **VM Snapshot Rollbacks**: Hardware counter rewinds and continuity token changes (verifying fail-fast `StatusDesync`).
+- **Observed Regressions**: Simulated counter rewinds and continuity token changes (verifying fail-fast `StatusDesync` while detector state survives).
 - **Hypervisor Freezes / Suspends**: VM pause/migration for 10s–60s across validity horizons.
 - **OS Clock Shaking**: Oscillator frequency wander (up to ±180 ppm) and sampling noise.
 - **Byzantine Upstreams**: Outlier sources (+1 hour offsets) filtered by Marzullo/Hull consensus.
-- **Strict Invariants**: Proves public clock monotonicity ($P_{k+1} \ge P_k$), true time containment ($P \pm \epsilon$ and $[L, U]$), and 100% bitwise trace reproducibility across identical seeds.
+- **Simulation Invariants**: Checks public clock monotonicity ($P_{k+1} \ge P_k$), true time containment ($P \pm \epsilon$ and $[L, U]$), and 100% bitwise trace reproducibility across identical seeds.
 
 ```bash
 go test -v -run TestDST .
@@ -190,5 +194,8 @@ gosuda.org/gstime
 
 ```bash
 go test -v -race -count=1 ./...
+go test -v -race -tags integration -count=1 ./... # local TLS/UDP only
+go vet ./...
+go vet -tags integration ./...
 gojgp check
 ```

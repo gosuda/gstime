@@ -43,9 +43,13 @@ type MeasurementResult struct {
 	DeltaRaw          int64 // round trip delay before clamp
 	DeltaClamped      int64 // round trip delay clamped to precision floor
 	RawMid            core.RawNanos
-	Center            core.GstInstant
-	NetworkBound      int64
-	HardInterval      core.TimeInterval
+	// RawMidReadBound bounds the raw-coordinate error at RawMid, independently
+	// of HardInterval's absolute-time uncertainty. Zero asserts an exact raw
+	// reference; custom SourceQueriers must provide their acquisition bound.
+	RawMidReadBound core.ErrorNs
+	Center          core.GstInstant
+	NetworkBound    int64
+	HardInterval    core.TimeInterval
 }
 
 // ComputeMeasurement processes the four-timestamp exchange according to Sections 2.6, 2.11, and 2.12.
@@ -83,6 +87,16 @@ func ComputeMeasurement(in MeasurementInput) (*MeasurementResult, error) {
 		deltaClamped = in.PrecisionFloorNs
 	}
 
+	// Endpoint read errors also bound the midpoint's raw coordinate. Using
+	// their maximum is conservative; an odd raw span needs one extra nanosecond
+	// for the floored integer midpoint. Do not substitute a later clock read.
+	rawMidReadBound := max(in.LocalSendReadError, in.LocalRecvReadError)
+	rounding := core.ErrorNs((in.LocalRecvRaw - in.LocalSendRaw) & 1)
+	if rawMidReadBound > math.MaxInt64-rounding ||
+		in.LocalSendReadError > math.MaxInt64-in.LocalRecvReadError {
+		return nil, core.ErrOverflow
+	}
+	rawMidReadBound += rounding
 	rawMid := in.LocalSendRaw + (in.LocalRecvRaw-in.LocalSendRaw)/2
 	center := in.LocalEstimateAtMid + core.GstInstant(theta)
 
@@ -110,6 +124,7 @@ func ComputeMeasurement(in MeasurementInput) (*MeasurementResult, error) {
 		DeltaRaw:          deltaRaw,
 		DeltaClamped:      deltaClamped,
 		RawMid:            rawMid,
+		RawMidReadBound:   rawMidReadBound,
 		Center:            center,
 		NetworkBound:      netBound,
 		HardInterval:      hardInterval,
