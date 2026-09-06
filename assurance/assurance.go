@@ -131,12 +131,22 @@ func PropagateAnchor(
 func checkedInstantAdd(base core.GstInstant, terms ...int64) (core.GstInstant, error) {
 	v := int64(base)
 	for _, d := range terms {
-		if (d > 0 && v > math.MaxInt64-d) || (d < 0 && v < math.MinInt64-d) {
+		if willTermOverflow(v, d) {
 			return 0, core.ErrOverflow
 		}
 		v += d
 	}
 	return core.GstInstant(v), nil
+}
+
+func willTermOverflow(v, d int64) bool {
+	if d > 0 {
+		return v > math.MaxInt64-d
+	}
+	if d < 0 {
+		return v < math.MinInt64-d
+	}
+	return false
 }
 
 // AssuranceClock manages the synchronization state machine and certified bounds.
@@ -210,12 +220,7 @@ func (ac *AssuranceClock) ProcessFullRound(
 
 	// If an existing valid anchor exists on matching domains, compute intersection
 	if ac.state.Status == core.StatusSynced || ac.state.Status == core.StatusHoldover {
-		if ac.state.Anchor != nil &&
-			ac.state.Anchor.LeapHistoryID == leapHistoryID &&
-			ac.state.Anchor.ConfigID == configID &&
-			ac.state.Anchor.ContinuityToken == continuityToken &&
-			ac.state.Anchor.RawScaleLower == scaleLower &&
-			ac.state.Anchor.RawScaleUpper == scaleUpper {
+		if isAnchorMatching(ac.state.Anchor, leapHistoryID, configID, continuityToken, scaleLower, scaleUpper) {
 
 			oldPropagated, err := PropagateAnchor(
 				ac.state.Anchor,
@@ -360,4 +365,17 @@ func (ac *AssuranceClock) EvaluateAt(
 	}
 
 	return interval, ac.state.Status, ac.state.Reason, nil
+}
+
+func isAnchorMatching(anchor *AssuranceAnchor, leapID, cfgID [32]byte, token uint64, low, upp core.RateScale) bool {
+	if anchor == nil {
+		return false
+	}
+	if anchor.LeapHistoryID != leapID || anchor.ConfigID != cfgID {
+		return false
+	}
+	if anchor.ContinuityToken != token {
+		return false
+	}
+	return anchor.RawScaleLower == low && anchor.RawScaleUpper == upp
 }

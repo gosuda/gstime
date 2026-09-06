@@ -140,10 +140,25 @@ func serverName(body []byte) (string, error) {
 			return "", errors.New("invalid NTP server label")
 		}
 		for _, c := range []byte(label) {
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			if !isValidDomainChar(c) {
 				return "", errors.New("NTP server name must be an ASCII FQDN or IP address")
 			}
 		}
 	}
 	return name + ".", nil // RFC 8915 section 4.1.7: never apply a DNS search suffix.
+}
+
+func isValidDomainChar(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '-':
+		return true
+	default:
+		return false
+	}
 }

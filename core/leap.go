@@ -305,10 +305,20 @@ func (lh *LeapHistory) UnixNanosToGstInstant(unix UnixNanos) (GstInstant, error)
 	}
 	offset := delta * 1_000_000_000
 	v := int64(unix)
-	if (offset > 0 && v > math.MaxInt64-offset) || (offset < 0 && v < math.MinInt64-offset) {
+	if willOffsetOverflow(v, offset) {
 		return 0, ErrOverflow
 	}
 	return GstInstant(v + offset), nil
+}
+
+func willOffsetOverflow(v, offset int64) bool {
+	if offset > 0 {
+		return v > math.MaxInt64-offset
+	}
+	if offset < 0 {
+		return v < math.MinInt64-offset
+	}
+	return false
 }
 
 // GstInstantToUnixProjection projects GstInstant to POSIX UnixNanos.
