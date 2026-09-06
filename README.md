@@ -1,4 +1,4 @@
-# GSTime & GSTimeAssure 4.0
+# GSTime & GSTimeAssure
 
 Zero-dependency, fault-tolerant time synchronization and certification engine in Go. Provides continuous SI-nanosecond tracking, dual-track separation between statistical estimation and interval certification, RFC 8915 Network Time Security (NTS), bounded leap smearing, and lock-free publication.
 
