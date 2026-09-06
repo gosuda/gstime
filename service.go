@@ -71,7 +71,8 @@ func (s *ClockService) Now() AssuredNow {
 	snap := s.publisher.Acquire()
 	reading := s.rawClock.Read()
 
-	est, _ := snap.EstimateMapping.Evaluate(reading.Raw)
+	est, errEst := snap.EstimateMapping.Evaluate(reading.Raw)
+	hasEst := (errEst == nil)
 
 	if snap.Assurance.Status == StatusSynced || snap.Assurance.Status == StatusHoldover {
 		inv, err := s.propagateSnapshot(snap, reading)
@@ -83,8 +84,11 @@ func (s *ClockService) Now() AssuredNow {
 
 			return AssuredNow{
 				Interval:            inv,
-				Estimate:            &est,
-				SymmetricEpsilon:    &symEps,
+				HasInterval:         true,
+				Estimate:            est,
+				HasEstimate:         hasEst,
+				SymmetricEpsilon:    symEps,
+				HasSymmetricEpsilon: true,
 				Status:              snap.Assurance.Status,
 				Reason:              snap.Assurance.Reason,
 				AssuranceGeneration: snap.Assurance.Generation,
@@ -101,9 +105,8 @@ func (s *ClockService) Now() AssuredNow {
 		// Propagation error: anchor expired, continuity mismatch, or bound too wide
 		reason := mapPropagationError(err)
 		return AssuredNow{
-			Interval:            nil,
-			Estimate:            &est,
-			SymmetricEpsilon:    nil,
+			Estimate:            est,
+			HasEstimate:         hasEst,
 			Status:              StatusDesync,
 			Reason:              reason,
 			AssuranceGeneration: snap.Assurance.Generation,
@@ -116,9 +119,8 @@ func (s *ClockService) Now() AssuredNow {
 
 	// UNANCHORED or DESYNC: return no interval
 	return AssuredNow{
-		Interval:            nil,
-		Estimate:            &est,
-		SymmetricEpsilon:    nil,
+		Estimate:            est,
+		HasEstimate:         hasEst,
 		Status:              snap.Assurance.Status,
 		Reason:              snap.Assurance.Reason,
 		AssuranceGeneration: snap.Assurance.Generation,
@@ -136,12 +138,12 @@ func (s *ClockService) NowUtc(expectedLeapID [32]byte) (earliest, latest UtcLabe
 	}
 
 	now := s.Now()
-	if now.Estimate != nil {
-		e := s.leapHistory.GstInstantToUtc(*now.Estimate)
+	if now.HasEstimate {
+		e := s.leapHistory.GstInstantToUtc(now.Estimate)
 		est = &e
 	}
 
-	if now.Interval == nil {
+	if !now.HasInterval {
 		return UtcLabel{}, UtcLabel{}, est, now.Status, nil
 	}
 
@@ -153,10 +155,10 @@ func (s *ClockService) NowUtc(expectedLeapID [32]byte) (earliest, latest UtcLabe
 // NowUnixProjection returns the POSIX projection with leap ambiguity flags (Section 7.4).
 func (s *ClockService) NowUnixProjection() (UnixProjection, error) {
 	now := s.Now()
-	if now.Estimate == nil {
+	if !now.HasEstimate {
 		return UnixProjection{}, errors.New("estimate unavailable")
 	}
-	return s.leapHistory.GstInstantToUnixProjection(*now.Estimate), nil
+	return s.leapHistory.GstInstantToUnixProjection(now.Estimate), nil
 }
 
 // NowPublicAssured returns the public clock's assured presentation view (Section 7.8).
@@ -171,11 +173,10 @@ func (s *ClockService) NowPublicAssured() PublicAssuredNow {
 		inv, err := s.propagateSnapshot(snap, reading)
 
 		if err == nil {
-			pubEps := clock.ComputePublicSymmetricEpsilon(pCenter, inv, reading.ReadBound)
+			pubEps := clock.ComputePublicSymmetricEpsilon(pCenter, &inv, reading.ReadBound)
 			if pubEps >= PublicEpsilonCapDefault {
 				return PublicAssuredNow{
 					Center:                 pCenter,
-					Interval:               nil,
 					PublicSymmetricEpsilon: pubEps,
 					Status:                 StatusDesync,
 					Reason:                 ReasonPublicBoundTooWide,
@@ -185,6 +186,7 @@ func (s *ClockService) NowPublicAssured() PublicAssuredNow {
 			return PublicAssuredNow{
 				Center:                 pCenter,
 				Interval:               inv,
+				HasInterval:            true,
 				PublicSymmetricEpsilon: pubEps,
 				Status:                 snap.Assurance.Status,
 				Reason:                 snap.Assurance.Reason,
@@ -193,7 +195,6 @@ func (s *ClockService) NowPublicAssured() PublicAssuredNow {
 
 		return PublicAssuredNow{
 			Center:                 pCenter,
-			Interval:               nil,
 			PublicSymmetricEpsilon: ErrorInfinity,
 			Status:                 StatusDesync,
 			Reason:                 mapPropagationError(err),
@@ -202,17 +203,16 @@ func (s *ClockService) NowPublicAssured() PublicAssuredNow {
 
 	return PublicAssuredNow{
 		Center:                 pCenter,
-		Interval:               nil,
 		PublicSymmetricEpsilon: ErrorInfinity,
 		Status:                 snap.Assurance.Status,
 		Reason:                 snap.Assurance.Reason,
 	}
 }
 
-func (s *ClockService) propagateSnapshot(snap *publish.Snapshot, reading clock.RawReading) (*core.TimeInterval, error) {
+func (s *ClockService) propagateSnapshot(snap *publish.Snapshot, reading clock.RawReading) (core.TimeInterval, error) {
 	low, upp := s.rawClock.ScaleEnvelope()
 	if snap.Assurance.Anchor != nil && (low != snap.Assurance.Anchor.RawScaleLower || upp != snap.Assurance.Anchor.RawScaleUpper) {
-		return nil, assurance.ErrContinuityTokenMismatch
+		return core.TimeInterval{}, assurance.ErrContinuityTokenMismatch
 	}
 	return assurance.PropagateAnchor(snap.Assurance.Anchor, reading.Raw, reading.ReadBound,
 		reading.ContinuityToken, snap.Assurance.LowerDebt, snap.Assurance.UpperDebt, snap.Assurance.MaxAssuranceWidthNs)
@@ -261,7 +261,7 @@ func (s *ClockService) PublicClock() *clock.PublicClock {
 // After implements the tri-state decision operation for t (Section 7.5).
 func (s *ClockService) After(t GstInstant) (Decision, SyncStatus, StatusReason) {
 	now := s.Now()
-	if now.Interval == nil {
+	if !now.HasInterval {
 		return Unknown, now.Status, now.Reason
 	}
 	if now.Interval.Earliest > t {
@@ -276,7 +276,7 @@ func (s *ClockService) After(t GstInstant) (Decision, SyncStatus, StatusReason) 
 // Before implements the tri-state decision operation for t (Section 7.5).
 func (s *ClockService) Before(t GstInstant) (Decision, SyncStatus, StatusReason) {
 	now := s.Now()
-	if now.Interval == nil {
+	if !now.HasInterval {
 		return Unknown, now.Status, now.Reason
 	}
 	if now.Interval.Latest < t {

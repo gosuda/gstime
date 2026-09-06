@@ -123,8 +123,8 @@ func TestSyncEngine_LifecycleAndZeroGoroutineLeak(t *testing.T) {
 	if now.Status != gstime.StatusSynced {
 		t.Fatalf("expected ClockService to be SYNCED, got %s", now.Status)
 	}
-	if now.Interval == nil {
-		t.Fatalf("expected non-nil interval after sync")
+	if !now.HasInterval {
+		t.Fatalf("expected valid interval after sync")
 	}
 
 	// Graceful shutdown

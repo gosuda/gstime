@@ -123,7 +123,7 @@ func TestAssuranceClock_VMSnapshotRawTimeReversal(t *testing.T) {
 
 	// Normal forward evaluation at raw = 60,000,000,000 (60s)
 	inv60, status60, _, err := ac.EvaluateAt(60_000_000_000, 10, 1)
-	if err != nil || status60 != core.StatusSynced || inv60 == nil {
+	if err != nil || status60 != core.StatusSynced || inv60.Earliest == 0 {
 		t.Fatalf("normal evaluation failed: %v", err)
 	}
 
@@ -141,7 +141,7 @@ func TestAssuranceClock_VMSnapshotRawTimeReversal(t *testing.T) {
 	if reason30 != core.ReasonRawDiscontinuity {
 		t.Fatalf("expected ReasonRawDiscontinuity, got %s", reason30)
 	}
-	if inv30 != nil {
-		t.Fatalf("expected nil interval on raw rewind, got %+v", inv30)
+	if inv30 != (core.TimeInterval{}) {
+		t.Fatalf("expected empty interval on raw rewind, got %+v", inv30)
 	}
 }

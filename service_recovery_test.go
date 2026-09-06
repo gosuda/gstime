@@ -44,7 +44,7 @@ func TestHoldoverLimitAndExplicitInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := svc.Now()
-	if now.Status != gstime.StatusDesync || now.Interval != nil {
+	if now.Status != gstime.StatusDesync || now.HasInterval {
 		t.Fatalf("explicit invalidation ignored: %+v", now)
 	}
 	if _, status, err := svc.PastWatermark(now.AssuranceEpochID, now.LeapHistoryID, now.ConfigID); err == nil || status != gstime.StatusDesync {
@@ -70,7 +70,7 @@ func TestConcurrentServicePublication(t *testing.T) {
 		wg.Go(func() {
 			for range 100 {
 				now := svc.Now()
-				if now.Status != gstime.StatusSynced || now.Interval == nil {
+				if now.Status != gstime.StatusSynced || !now.HasInterval {
 					t.Errorf("incoherent read: %+v", now)
 				}
 				_, status, err := svc.PastWatermark(now.AssuranceEpochID, now.LeapHistoryID, now.ConfigID)

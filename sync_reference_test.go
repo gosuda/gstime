@@ -79,7 +79,7 @@ func TestRegressionPollOnceMustNormalizeSampleTimes(t *testing.T) {
 			}
 			now := svc.Now()
 			t.Logf("status=%s interval=%+v true_time=%d", now.Status, now.Interval, tc.truthAtSelection)
-			if now.Interval == nil || now.Interval.Earliest > tc.truthAtSelection || now.Interval.Latest < tc.truthAtSelection {
+			if !now.HasInterval || now.Interval.Earliest > tc.truthAtSelection || now.Interval.Latest < tc.truthAtSelection {
 				t.Fatal("certified interval excludes true time at selection")
 			}
 		})

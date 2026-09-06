@@ -82,7 +82,7 @@ For distributed databases requiring external consistency via certified interval 
 
 ```go
 now := svc.Now()
-if now.Interval != nil {
+if now.HasInterval {
 	// Certified interval [Earliest, Latest] enclosing true SI time
 	fmt.Printf("Certified Range: [%d, %d]\n", now.Interval.Earliest, now.Interval.Latest)
 }

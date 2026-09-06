@@ -167,7 +167,7 @@ func testNTSEndToEndNegotiatedPort(t *testing.T, cookieSize int) {
 		}
 	}
 	now := svc.Now()
-	if now.Status != StatusSynced || now.Interval == nil || now.Interval.Earliest > want || now.Interval.Latest < want {
+	if now.Status != StatusSynced || !now.HasInterval || now.Interval.Earliest > want || now.Interval.Latest < want {
 		t.Fatalf("incorrect NTS-certified interval: %+v", now)
 	}
 	session := engine.querier.(*defaultSourceQuerier).ntsState[cfg.Sources[0].Endpoint]

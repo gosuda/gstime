@@ -184,8 +184,8 @@ func (sim *DSTSimulator) Step(t *testing.T, step int) {
 	}
 
 	// Invariant 3: GSTimeAssure Interval Safety
-	// When status is SYNCED and interval is non-nil, true physical time MUST be within [Earliest, Latest]
-	if now.Status == gstime.StatusSynced && now.Interval != nil {
+	// When status is SYNCED and interval is valid, true physical time MUST be within [Earliest, Latest]
+	if now.Status == gstime.StatusSynced && now.HasInterval {
 		if sim.physicalTime < now.Interval.Earliest || sim.physicalTime > now.Interval.Latest {
 			t.Fatalf("[DST Seed %d, Step %d] Invariant Violation: True time %d outside assured interval [%d, %d]",
 				sim.seed, step, sim.physicalTime, now.Interval.Earliest, now.Interval.Latest)

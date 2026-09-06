@@ -154,7 +154,7 @@ func TestPollUsesAcquisitionMidpointBound(t *testing.T) {
 	}
 	got := svc.Now()
 	truth := core.GstInstant(100_001_000_000)
-	if got.Interval == nil || got.Interval.Latest < truth || got.Interval.Earliest > truth {
+	if !got.HasInterval || got.Interval.Latest < truth || got.Interval.Earliest > truth {
 		t.Fatalf("acquisition uncertainty lost: %+v, truth=%d", got.Interval, truth)
 	}
 }

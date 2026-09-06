@@ -56,7 +56,7 @@ func ExampleClockService_Now() {
 	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
 
 	now := svc.Now()
-	fmt.Printf("Status: %s, HasInterval: %t\n", now.Status, now.Interval != nil)
+	fmt.Printf("Status: %s, HasInterval: %t\n", now.Status, now.HasInterval)
 	// Output:
 	// Status: SYNCED, HasInterval: true
 }

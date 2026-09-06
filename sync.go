@@ -258,7 +258,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 		if err != nil {
 			continue
 		}
-		byDomain[r.domain] = append(byDomain[r.domain], *inv)
+		byDomain[r.domain] = append(byDomain[r.domain], inv)
 	}
 	var domains []string
 	for domain := range byDomain {

@@ -60,30 +60,30 @@ func PropagateAnchor(
 	lowerDebt core.DurationNs,
 	upperDebt core.DurationNs,
 	maxAssuranceWidthNs int64,
-) (*core.TimeInterval, error) {
+) (core.TimeInterval, error) {
 	if anchor == nil {
-		return nil, errors.New("no anchor available")
+		return core.TimeInterval{}, errors.New("no anchor available")
 	}
 	if r < anchor.RawAnchor {
-		return nil, ErrRawEarlierThanAnchor
+		return core.TimeInterval{}, ErrRawEarlierThanAnchor
 	}
 	if r > anchor.ValidUntilRaw {
-		return nil, ErrAnchorExpired
+		return core.TimeInterval{}, ErrAnchorExpired
 	}
 	if continuityToken != anchor.ContinuityToken {
-		return nil, ErrContinuityTokenMismatch
+		return core.TimeInterval{}, ErrContinuityTokenMismatch
 	}
 
 	if anchor.RawScaleLower <= 0 || anchor.RawScaleUpper < anchor.RawScaleLower {
-		return nil, core.ErrInvalidRange
+		return core.TimeInterval{}, core.ErrInvalidRange
 	}
 	dr := r - anchor.RawAnchor
 	if uint64(anchor.RawReadBound) > math.MaxUint64-uint64(currentRawReadBound) {
-		return nil, core.ErrOverflow
+		return core.TimeInterval{}, core.ErrOverflow
 	}
 	rawDeltaError := uint64(anchor.RawReadBound) + uint64(currentRawReadBound)
 	if uint64(dr) > math.MaxInt64 || rawDeltaError > uint64(math.MaxInt64)-uint64(dr) {
-		return nil, core.ErrOverflow
+		return core.TimeInterval{}, core.ErrOverflow
 	}
 
 	var drLo uint64
@@ -94,35 +94,35 @@ func PropagateAnchor(
 
 	advanceLo, err := core.MulScaleDurationFloor(anchor.RawScaleLower, core.RawNanos(drLo))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 	advanceHi, err := core.MulScaleDurationCeil(anchor.RawScaleUpper, core.RawNanos(drHi))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 
 	L, err := checkedInstantAdd(anchor.LowerAtAnchor, advanceLo, int64(lowerDebt))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 	U, err := checkedInstantAdd(anchor.UpperAtAnchor, advanceHi, int64(upperDebt))
 	if err != nil {
-		return nil, err
+		return core.TimeInterval{}, err
 	}
 
 	if L > U {
-		return nil, core.ErrInvalidRange
+		return core.TimeInterval{}, core.ErrInvalidRange
 	}
 
 	if L < 0 && U > core.GstInstant(math.MaxInt64)+L {
-		return nil, core.ErrOverflow
+		return core.TimeInterval{}, core.ErrOverflow
 	}
 	width := int64(U - L)
 	if maxAssuranceWidthNs > 0 && width >= maxAssuranceWidthNs {
-		return nil, ErrBoundTooWide
+		return core.TimeInterval{}, ErrBoundTooWide
 	}
 
-	return &core.TimeInterval{
+	return core.TimeInterval{
 		Earliest: L,
 		Latest:   U,
 	}, nil
@@ -337,12 +337,12 @@ func (ac *AssuranceClock) EvaluateAt(
 	r core.RawNanos,
 	currentRawReadBound core.ErrorNs,
 	continuityToken uint64,
-) (*core.TimeInterval, core.SyncStatus, core.StatusReason, error) {
+) (core.TimeInterval, core.SyncStatus, core.StatusReason, error) {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
 
 	if ac.state.Status == core.StatusUnanchored || ac.state.Status == core.StatusDesync {
-		return nil, ac.state.Status, ac.state.Reason, nil
+		return core.TimeInterval{}, ac.state.Status, ac.state.Reason, nil
 	}
 
 	interval, err := PropagateAnchor(
@@ -356,12 +356,12 @@ func (ac *AssuranceClock) EvaluateAt(
 	)
 	if err != nil {
 		if errors.Is(err, ErrAnchorExpired) || errors.Is(err, ErrBoundTooWide) {
-			return nil, core.StatusDesync, core.ReasonBoundTooOld, err
+			return core.TimeInterval{}, core.StatusDesync, core.ReasonBoundTooOld, err
 		}
 		if errors.Is(err, ErrContinuityTokenMismatch) || errors.Is(err, ErrRawEarlierThanAnchor) {
-			return nil, core.StatusDesync, core.ReasonRawDiscontinuity, err
+			return core.TimeInterval{}, core.StatusDesync, core.ReasonRawDiscontinuity, err
 		}
-		return nil, core.StatusDesync, core.ReasonArithmeticOverflow, err
+		return core.TimeInterval{}, core.StatusDesync, core.ReasonArithmeticOverflow, err
 	}
 
 	return interval, ac.state.Status, ac.state.Reason, nil

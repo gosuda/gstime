@@ -92,7 +92,7 @@ func TestRegressionNTPMustConvertUnixToGstTimescale(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("status=%s interval=%+v wantGst=%d gotUnix=%d wantUnix=%d utc=%v", now.Status, now.Interval, wantGst, proj.Nanos, wantUnix, utc)
-	if now.Interval == nil || now.Interval.Earliest > wantGst || now.Interval.Latest < wantGst {
+	if !now.HasInterval || now.Interval.Earliest > wantGst || now.Interval.Latest < wantGst {
 		t.Error("certified GstInstant interval excludes the configured leap-aware instant")
 	}
 	// Common-reference propagation includes raw read uncertainty, so the
