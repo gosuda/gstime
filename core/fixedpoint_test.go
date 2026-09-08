@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"math"
 	"math/big"
 	"testing"
@@ -125,5 +126,59 @@ func TestFloorCeilDiv(t *testing.T) {
 			t.Fatalf("div %d/%d: got floor=%d ceil=%d, want floor=%d ceil=%d",
 				tc.a, tc.b, f, c, tc.wantFloor, tc.wantCeil)
 		}
+	}
+}
+
+func TestCheckedInstantAddSignedBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		base     GstInstant
+		delta    int64
+		want     GstInstant
+		overflow bool
+	}{
+		{name: "positive overflow", base: math.MaxInt64, delta: 1, overflow: true},
+		{name: "negative overflow", base: math.MinInt64, delta: -1, overflow: true},
+		{name: "minimum addend", base: math.MaxInt64, delta: math.MinInt64, want: -1},
+		{name: "maximum addend", base: math.MinInt64, delta: math.MaxInt64, want: -1},
+		{name: "maximum result", base: math.MaxInt64 - 1, delta: 1, want: math.MaxInt64},
+		{name: "minimum result", base: math.MinInt64 + 1, delta: -1, want: math.MinInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CheckedInstantAdd(tc.base, tc.delta)
+			if tc.overflow {
+				if !errors.Is(err, ErrOverflow) {
+					t.Fatalf("sum error = %v, want ErrOverflow", err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("sum = %d, %v; want %d", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSymmetricEpsilonUnsignedDistances(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		center   GstInstant
+		interval TimeInterval
+		extra    ErrorNs
+		want     ErrorNs
+	}{
+		{name: "opposite extremes", center: math.MaxInt64, interval: TimeInterval{math.MinInt64, math.MinInt64}, want: ErrorInfinity},
+		{name: "large finite distance", center: math.MinInt64 + 1, interval: TimeInterval{math.MaxInt64, math.MaxInt64}, want: math.MaxUint64 - 1},
+		{name: "distance plus read saturation", center: math.MinInt64 + 1, interval: TimeInterval{math.MaxInt64, math.MaxInt64}, extra: 2, want: ErrorInfinity},
+		{name: "integer beyond float precision", center: 1<<53 + 1, interval: TimeInterval{0, 0}, extra: 1, want: 1<<53 + 2},
+		{name: "asymmetric interval", center: 10, interval: TimeInterval{-20, 25}, extra: 3, want: 33},
+		{name: "unbounded read", center: 10, interval: TimeInterval{-20, 25}, extra: ErrorInfinity, want: ErrorInfinity},
+		{name: "invalid interval", interval: TimeInterval{1, 0}, want: ErrorInfinity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SymmetricEpsilon(tc.center, tc.interval, tc.extra); got != tc.want {
+				t.Fatalf("epsilon = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

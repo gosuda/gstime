@@ -33,6 +33,9 @@ func (u UtcLabel) String() string {
 	sec := u.SecondOfDay % 60
 	min := (u.SecondOfDay / 60) % 60
 	hour := u.SecondOfDay / 3600
+	if u.SecondOfDay == 86400 {
+		hour, min, sec = 23, 59, 60
+	}
 	return fmt.Sprintf("%sT%02d:%02d:%02d.%09dZ", u.Date, hour, min, sec, u.Nanos)
 }
 
@@ -68,9 +71,25 @@ var (
 	ErrInvalidLeapDelta        = errors.New("leap transition delta must be exactly +1 or -1")
 	ErrReservedBytesNonzero    = errors.New("reserved bytes in leap entry must be zero")
 	ErrInvalidSecondOfDay      = errors.New("invalid second of day")
+	ErrInvalidLeapTransition   = errors.New("leap transition must be midnight between representable Gregorian dates")
+	ErrInvalidGregorianDate    = errors.New("invalid Gregorian date")
+	ErrInvalidNanos            = errors.New("nanos out of range")
+	errLeapHistoryTooShort     = errors.New("leap history data too short")
+	errAmbiguousUnixSecond     = errors.New("ambiguous or deleted Unix second at leap transition")
 )
 
 const leapMagic = "GSTL1"
+
+func validateLeapTransition(sec int64) error {
+	if sec%86400 != 0 {
+		return ErrInvalidLeapTransition
+	}
+	year := time.Unix(sec, 0).UTC().Year()
+	if year < math.MinInt32 || year > math.MaxInt32 || time.Unix(sec-1, 0).UTC().Year() < math.MinInt32 {
+		return ErrInvalidLeapTransition
+	}
+	return nil
+}
 
 // NewLeapHistory creates and validates a LeapHistory from entries.
 func NewLeapHistory(initialTaiMinusUtc int32, entries []LeapEntry) (*LeapHistory, error) {
@@ -94,6 +113,9 @@ func NewLeapHistory(initialTaiMinusUtc int32, entries []LeapEntry) (*LeapHistory
 		}
 		if e.Delta != 1 && e.Delta != -1 {
 			return nil, ErrInvalidLeapDelta
+		}
+		if err := validateLeapTransition(e.TransitionUnixSecond); err != nil {
+			return nil, err
 		}
 		lastSec = e.TransitionUnixSecond
 
@@ -124,7 +146,7 @@ func NewLeapHistory(initialTaiMinusUtc int32, entries []LeapEntry) (*LeapHistory
 // ParseLeapHistory parses the canonical GSTL1 encoding.
 func ParseLeapHistory(data []byte) (*LeapHistory, error) {
 	if len(data) < 13 {
-		return nil, errors.New("leap history data too short")
+		return nil, errLeapHistoryTooShort
 	}
 	if string(data[:5]) != leapMagic {
 		return nil, ErrInvalidLeapMagic
@@ -155,6 +177,9 @@ func ParseLeapHistory(data []byte) (*LeapHistory, error) {
 		}
 		if delta != 1 && delta != -1 {
 			return nil, ErrInvalidLeapDelta
+		}
+		if err := validateLeapTransition(sec); err != nil {
+			return nil, err
 		}
 		for _, b := range reserved {
 			if b != 0 {
@@ -192,8 +217,12 @@ func (lh *LeapHistory) CanonicalBytes() []byte {
 // GstInstantToUtc converts a continuous GstInstant to UtcLabel.
 func (lh *LeapHistory) GstInstantToUtc(inst GstInstant) UtcLabel {
 	siNanos := int64(inst)
-	siSec := FloorDiv(siNanos, 1_000_000_000)
-	nanoRem := uint32(siNanos - siSec*1_000_000_000)
+	siSec := siNanos / 1_000_000_000
+	nanoRem := siNanos % 1_000_000_000
+	if nanoRem < 0 {
+		siSec--
+		nanoRem += 1_000_000_000
+	}
 
 	var cumDelta int64
 	for _, e := range lh.Entries {
@@ -209,7 +238,7 @@ func (lh *LeapHistory) GstInstantToUtc(inst GstInstant) UtcLabel {
 						Day:   uint8(t.Day()),
 					},
 					SecondOfDay:   86400,
-					Nanos:         nanoRem,
+					Nanos:         uint32(nanoRem),
 					LeapHistoryID: lh.ID,
 				}
 			}
@@ -231,7 +260,7 @@ func (lh *LeapHistory) GstInstantToUtc(inst GstInstant) UtcLabel {
 			Day:   uint8(t.Day()),
 		},
 		SecondOfDay:   secOfDay,
-		Nanos:         nanoRem,
+		Nanos:         uint32(nanoRem),
 		LeapHistoryID: lh.ID,
 	}
 }
@@ -245,44 +274,44 @@ func (lh *LeapHistory) UtcToGstInstant(utc UtcLabel) (GstInstant, error) {
 		return 0, ErrInvalidSecondOfDay
 	}
 	if utc.Nanos >= 1_000_000_000 {
-		return 0, errors.New("nanos out of range")
+		return 0, ErrInvalidNanos
+	}
+	civilDay := time.Date(int(utc.Date.Year), time.Month(utc.Date.Month), int(utc.Date.Day), 0, 0, 0, 0, time.UTC)
+	year, month, day := civilDay.Date()
+	if year != int(utc.Date.Year) || month != time.Month(utc.Date.Month) || day != int(utc.Date.Day) {
+		return 0, ErrInvalidGregorianDate
 	}
 
-	if utc.SecondOfDay == 86400 {
-		civilTime := time.Date(int(utc.Date.Year), time.Month(utc.Date.Month), int(utc.Date.Day), 23, 59, 59, 0, time.UTC)
-		targetTransition := civilTime.Unix() + 1
-
-		var cumDelta int64
-		found := false
-		for _, e := range lh.Entries {
-			if e.TransitionUnixSecond == targetTransition && e.Delta == 1 {
-				leapSiSec := e.TransitionUnixSecond + cumDelta
-				inst := GstInstant(leapSiSec*1_000_000_000 + int64(utc.Nanos))
-				return inst, nil
-			}
-			cumDelta += int64(e.Delta)
-		}
-		if !found {
-			return 0, fmt.Errorf("no positive leap second recorded for date %s", utc.Date)
-		}
-	}
-
-	hour := int(utc.SecondOfDay / 3600)
-	min := int((utc.SecondOfDay / 60) % 60)
-	sec := int(utc.SecondOfDay % 60)
-	t := time.Date(int(utc.Date.Year), time.Month(utc.Date.Month), int(utc.Date.Day), hour, min, sec, 0, time.UTC)
-	unixSec := t.Unix()
-
+	unixSec := civilDay.Unix() + int64(utc.SecondOfDay)
 	var cumDelta int64
 	for _, e := range lh.Entries {
+		if utc.SecondOfDay == 86400 && e.TransitionUnixSecond == unixSec && e.Delta == 1 {
+			return gstInstantFromSeconds(unixSec+cumDelta, utc.Nanos)
+		}
+		if e.Delta == -1 && unixSec == e.TransitionUnixSecond-1 {
+			return 0, ErrInvalidSecondOfDay
+		}
 		if unixSec >= e.TransitionUnixSecond {
 			cumDelta += int64(e.Delta)
 		}
 	}
+	if utc.SecondOfDay == 86400 {
+		return 0, fmt.Errorf("no positive leap second recorded for date %s", utc.Date)
+	}
+	return gstInstantFromSeconds(unixSec+cumDelta, utc.Nanos)
+}
 
-	siSec := unixSec + cumDelta
-	inst := GstInstant(siSec*1_000_000_000 + int64(utc.Nanos))
-	return inst, nil
+func gstInstantFromSeconds(sec int64, nanos uint32) (GstInstant, error) {
+	fraction := int64(nanos)
+	// Borrow a second to keep the product representable at the signed lower boundary.
+	if sec < 0 {
+		sec++
+		fraction -= 1_000_000_000
+	}
+	if sec < math.MinInt64/1_000_000_000 || sec > math.MaxInt64/1_000_000_000 {
+		return 0, ErrOverflow
+	}
+	return CheckedInstantAdd(GstInstant(sec*1_000_000_000), fraction)
 }
 
 // UnixNanosToGstInstant converts an unambiguous POSIX instant using this history.
@@ -294,7 +323,7 @@ func (lh *LeapHistory) UnixNanosToGstInstant(unix UnixNanos) (GstInstant, error)
 	var delta int64
 	for _, e := range lh.Entries {
 		if e.TransitionUnixSecond != math.MinInt64 && sec == e.TransitionUnixSecond-1 {
-			return 0, errors.New("ambiguous or deleted Unix second at leap transition")
+			return 0, errAmbiguousUnixSecond
 		}
 		if sec >= e.TransitionUnixSecond {
 			delta += int64(e.Delta)
@@ -303,22 +332,7 @@ func (lh *LeapHistory) UnixNanosToGstInstant(unix UnixNanos) (GstInstant, error)
 	if delta > math.MaxInt64/1_000_000_000 || delta < math.MinInt64/1_000_000_000 {
 		return 0, ErrOverflow
 	}
-	offset := delta * 1_000_000_000
-	v := int64(unix)
-	if willOffsetOverflow(v, offset) {
-		return 0, ErrOverflow
-	}
-	return GstInstant(v + offset), nil
-}
-
-func willOffsetOverflow(v, offset int64) bool {
-	if offset > 0 {
-		return v > math.MaxInt64-offset
-	}
-	if offset < 0 {
-		return v < math.MinInt64-offset
-	}
-	return false
+	return CheckedInstantAdd(GstInstant(unix), delta*1_000_000_000)
 }
 
 // GstInstantToUnixProjection projects GstInstant to POSIX UnixNanos.

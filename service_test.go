@@ -33,7 +33,9 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 
 	// 2. Initialize estimate and publish full assurance round
 	targetTime := GstInstant(1_700_000_000 * 1_000_000_000)
-	_ = svc.InitializeEstimate(1_000_000_000, targetTime, 0)
+	if err := svc.InitializeEstimate(1_000_000_000, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	hull := TimeInterval{
 		Earliest: targetTime - 50_000,
@@ -81,7 +83,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 	}
 
 	// 5. PastWatermark
-	wm, stat, err := svc.PastWatermark(svc.epochID, lh.ID, cfgID)
+	wm, stat, err := svc.PastWatermark(nowSynced.AssuranceEpochID, lh.ID, cfgID)
 	if err != nil || stat != StatusSynced {
 		t.Fatalf("PastWatermark failed: err=%v, stat=%s", err, stat)
 	}
@@ -91,7 +93,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 
 	// Mismatched ID rejection
 	var wrongCfgID [32]byte
-	_, _, err = svc.PastWatermark(svc.epochID, lh.ID, wrongCfgID)
+	_, _, err = svc.PastWatermark(nowSynced.AssuranceEpochID, lh.ID, wrongCfgID)
 	if err != ErrConfigurationMismatch {
 		t.Fatalf("expected ErrConfigurationMismatch on wrong config ID, got %v", err)
 	}
@@ -101,7 +103,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	err = svc.CommitWait(ctx, wm-10, svc.epochID, lh.ID, cfgID)
+	err = svc.CommitWait(ctx, wm-10, nowSynced.AssuranceEpochID, lh.ID, cfgID)
 	if err != nil {
 		t.Fatalf("CommitWait for past commitTs should succeed: %v", err)
 	}
@@ -110,7 +112,7 @@ func TestClockServiceLifecycleAndDecisions(t *testing.T) {
 	ctxShort, cancelShort := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancelShort()
 
-	err = svc.CommitWait(ctxShort, targetTime+1_000_000_000, svc.epochID, lh.ID, cfgID)
+	err = svc.CommitWait(ctxShort, targetTime+1_000_000_000, nowSynced.AssuranceEpochID, lh.ID, cfgID)
 	if err != ErrDeadlineExceeded {
 		t.Fatalf("expected ErrDeadlineExceeded, got %v", err)
 	}
@@ -125,7 +127,9 @@ func TestClockService_DaylightSavingTime(t *testing.T) {
 	svc := NewClockService(raw, lh, cfgID, 32_000_000_000)
 
 	targetTime := GstInstant(1_700_000_000 * 1_000_000_000)
-	_ = svc.InitializeEstimate(10_000_000_000, targetTime, 0)
+	if err := svc.InitializeEstimate(10_000_000_000, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	hull := TimeInterval{Earliest: targetTime - 1_000, Latest: targetTime + 1_000}
 	err := svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
@@ -144,7 +148,9 @@ func TestClockService_DaylightSavingTime(t *testing.T) {
 	// 1. Simulate clock running ahead by 1 hour (e.g. DST Spring Forward excursion)
 	hourNs := int64(3600 * 1_000_000_000)
 	rawCur := raw.Read().Raw
-	_ = svc.InitializeEstimate(rawCur, targetTime+GstInstant(hourNs), 0)
+	if err := svc.InitializeEstimate(rawCur, targetTime+GstInstant(hourNs), 0); err != nil {
+		t.Fatal(err)
+	}
 
 	pubAhead := svc.NowPublicAssured()
 	if pubAhead.Center < targetTime+GstInstant(hourNs) {
@@ -152,7 +158,9 @@ func TestClockService_DaylightSavingTime(t *testing.T) {
 	}
 
 	// 2. Simulate DST "Fall Back" (true civil/consensus time is at targetTime, 1 hour behind pubAhead)
-	_ = svc.InitializeEstimate(rawCur, targetTime, 0)
+	if err := svc.InitializeEstimate(rawCur, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	// Invariant: Public clock MUST NOT step backwards despite 1-hour backward shift
 	pubClamped := svc.NowPublicAssured()
@@ -174,9 +182,13 @@ func TestClockService_DaylightSavingTime(t *testing.T) {
 	raw.Advance(RawNanos(hourNs + 1_000_000_000))
 	rawNew := raw.Read().Raw
 	newTarget := targetTime + GstInstant(hourNs+1_000_000_000)
-	_ = svc.InitializeEstimate(rawNew, newTarget, 0)
+	if err := svc.InitializeEstimate(rawNew, newTarget, 0); err != nil {
+		t.Fatal(err)
+	}
 	newHull := TimeInterval{Earliest: newTarget - 1_000, Latest: newTarget + 1_000}
-	_ = svc.PublishAssuranceRound(rawNew, newHull, 1, 3, 2, 1, rawNew+100_000_000_000)
+	if err := svc.PublishAssuranceRound(rawNew, newHull, 1, 3, 2, 1, rawNew+100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	pubRecovered := svc.NowPublicAssured()
 	if pubRecovered.Status != StatusSynced {
@@ -198,10 +210,14 @@ func TestClockService_VMSnapshotJump(t *testing.T) {
 	svc := NewClockService(raw, lh, cfgID, 32_000_000_000)
 
 	targetTime := GstInstant(1_700_000_000 * 1_000_000_000)
-	_ = svc.InitializeEstimate(10_000_000_000, targetTime, 0)
+	if err := svc.InitializeEstimate(10_000_000_000, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	hull := TimeInterval{Earliest: targetTime - 50_000, Latest: targetTime + 50_000}
-	_ = svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 50_000_000_000)
+	if err := svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 50_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	pPre := svc.NowPublicAssured().Center
 
@@ -237,7 +253,9 @@ func TestClockService_VMSnapshotJump(t *testing.T) {
 	// 3. VM Resume re-synchronization with fresh consensus round
 	rawNow := raw.Read().Raw
 	resumeTarget := targetTime + 7200*1_000_000_000
-	_ = svc.InitializeEstimate(rawNow, resumeTarget, 0)
+	if err := svc.InitializeEstimate(rawNow, resumeTarget, 0); err != nil {
+		t.Fatal(err)
+	}
 	resumeHull := TimeInterval{Earliest: resumeTarget - 100, Latest: resumeTarget + 100}
 	err := svc.PublishAssuranceRound(rawNow, resumeHull, 1, 3, 2, 1, rawNow+100_000_000_000)
 	if err != nil {
@@ -267,7 +285,9 @@ func TestClockService_VMSnapshotTimeReversalAndFreeze(t *testing.T) {
 	svc := NewClockService(raw, lh, cfgID, 32_000_000_000)
 
 	targetTime := GstInstant(1_700_000_000 * 1_000_000_000)
-	_ = svc.InitializeEstimate(50_000_000_000, targetTime, 0)
+	if err := svc.InitializeEstimate(50_000_000_000, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	hull := TimeInterval{Earliest: targetTime - 1_000, Latest: targetTime + 1_000}
 	err := svc.PublishAssuranceRound(50_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
@@ -332,7 +352,9 @@ func TestClockService_VMSnapshotTimeReversalAndFreeze(t *testing.T) {
 	// 4. Synchronizer re-anchors to current restored timeline at 40s
 	rawRestored := raw.Read().Raw                    // 40s
 	newTimelineTarget := targetTime - 10_000_000_000 // true time in restored timeline
-	_ = svc.InitializeEstimate(rawRestored, newTimelineTarget, 0)
+	if err := svc.InitializeEstimate(rawRestored, newTimelineTarget, 0); err != nil {
+		t.Fatal(err)
+	}
 	newHull := TimeInterval{Earliest: newTimelineTarget - 1_000, Latest: newTimelineTarget + 1_000}
 	err = svc.PublishAssuranceRound(rawRestored, newHull, 1, 3, 2, 1, rawRestored+100_000_000_000)
 	if err != nil {
@@ -357,9 +379,13 @@ func TestClockService_VMSnapshotTimeReversalAndFreeze(t *testing.T) {
 	raw.Advance(advanceCatchUp)
 	rawCaughtUp := raw.Read().Raw
 	caughtUpTarget := newTimelineTarget + GstInstant(advanceCatchUp)
-	_ = svc.InitializeEstimate(rawCaughtUp, caughtUpTarget, 0)
+	if err := svc.InitializeEstimate(rawCaughtUp, caughtUpTarget, 0); err != nil {
+		t.Fatal(err)
+	}
 	caughtUpHull := TimeInterval{Earliest: caughtUpTarget - 1_000, Latest: caughtUpTarget + 1_000}
-	_ = svc.PublishAssuranceRound(rawCaughtUp, caughtUpHull, 1, 3, 2, 1, rawCaughtUp+100_000_000_000)
+	if err := svc.PublishAssuranceRound(rawCaughtUp, caughtUpHull, 1, 3, 2, 1, rawCaughtUp+100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	pubCaughtUp := svc.NowPublicAssured()
 	if pubCaughtUp.Status != StatusSynced {
@@ -399,9 +425,13 @@ func TestClockService_WaitSync(t *testing.T) {
 	}()
 
 	// Publish valid round
-	_ = svc.InitializeEstimate(10_000_000_000, targetTime, 0)
+	if err := svc.InitializeEstimate(10_000_000_000, targetTime, 0); err != nil {
+		t.Fatal(err)
+	}
 	hull := TimeInterval{Earliest: targetTime - 1_000, Latest: targetTime + 1_000}
-	_ = svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(10_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case err := <-syncDone:

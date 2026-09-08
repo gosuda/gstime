@@ -83,7 +83,7 @@ func TestHoldoverAndWatermarkMonotonicity(t *testing.T) {
 		t.Fatalf("round 1 failed: %v", err)
 	}
 
-	wm0 := ac.Snapshot().PastWatermark
+	wm0 := ac.Snapshot().PastWatermark()
 	if wm0 != 1_000_000_000 {
 		t.Fatalf("initial watermark mismatch: got %d want 1_000_000_000", wm0)
 	}

@@ -154,6 +154,20 @@ type AssuredNow struct {
 	Age                 DurationNs
 }
 
+// AssuredUtcNow is a civil view of one coherent assured reading.
+type AssuredUtcNow struct {
+	Earliest         UtcLabel
+	Latest           UtcLabel
+	Estimate         UtcLabel
+	HasInterval      bool
+	HasEstimate      bool
+	Status           SyncStatus
+	Reason           StatusReason
+	AssuranceEpochID [16]byte
+	LeapHistoryID    [32]byte
+	ConfigID         [32]byte
+}
+
 // PublicAssuredNow represents the public clock's assured presentation view.
 type PublicAssuredNow struct {
 	Center                 GstInstant

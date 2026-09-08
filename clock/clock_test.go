@@ -14,7 +14,9 @@ func TestReanchorContinuityRandomized(t *testing.T) {
 	clk := NewEstimateClock()
 	raw0 := core.RawNanos(5_000_000_000)
 	time0 := core.GstInstant(1_700_000_000 * 1_000_000_000)
-	clk.InitializeAnchors(raw0, time0, 0)
+	if err := clk.InitializeAnchors(raw0, time0, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	currRaw := raw0
 
@@ -61,7 +63,9 @@ func TestDebtAccrualNoInstantStep(t *testing.T) {
 	clk := NewEstimateClock()
 	raw0 := core.RawNanos(10_000_000_000)
 	time0 := core.GstInstant(1_700_000_000 * 1_000_000_000)
-	clk.InitializeAnchors(raw0, time0, 0)
+	if err := clk.InitializeAnchors(raw0, time0, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	val0, _ := clk.Evaluate(raw0)
 
@@ -91,7 +95,9 @@ func TestExplicitPhaseStep(t *testing.T) {
 	clk := NewEstimateClock()
 	raw0 := core.RawNanos(10_000_000_000)
 	time0 := core.GstInstant(100_000_000_000)
-	clk.InitializeAnchors(raw0, time0, 0)
+	if err := clk.InitializeAnchors(raw0, time0, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	// Step forward by +50,000,000 ns
 	stepVal := core.PhaseNs(50_000_000)
@@ -166,20 +172,29 @@ func TestPublicClockMonotonicClamp(t *testing.T) {
 	pc := NewPublicClock()
 
 	// Read 1: normal
-	p1, d1 := pc.ReadPublicInstant(100, 1000)
+	p1, d1, err := pc.ReadPublicInstant(100, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p1 != 100 || d1 != 0 {
 		t.Fatalf("read 1 mismatch: p1=%d d1=%d", p1, d1)
 	}
 
 	// Read 2: higher
-	p2, d2 := pc.ReadPublicInstant(200, 2000)
+	p2, d2, err := pc.ReadPublicInstant(200, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p2 != 200 || d2 != 0 {
 		t.Fatalf("read 2 mismatch: p2=%d d2=%d", p2, d2)
 	}
 
 	// Read 3: estimate stepped backwards to 150!
 	// Public clock must clamp to 200, with clamp debt = 50!
-	p3, d3 := pc.ReadPublicInstant(150, 3000)
+	p3, d3, err := pc.ReadPublicInstant(150, 3000)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p3 != 200 {
 		t.Fatalf("expected clamped p3=200, got %d", p3)
 	}
@@ -188,7 +203,10 @@ func TestPublicClockMonotonicClamp(t *testing.T) {
 	}
 
 	// Read 4: caught back up to 250
-	p4, d4 := pc.ReadPublicInstant(250, 4000)
+	p4, d4, err := pc.ReadPublicInstant(250, 4000)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p4 != 250 || d4 != 0 {
 		t.Fatalf("read 4 mismatch: p4=%d d4=%d", p4, d4)
 	}
@@ -203,7 +221,10 @@ func TestPublicClock_DSTFallBackAndSpringForward(t *testing.T) {
 	raw0 := core.RawNanos(10_000_000_000)
 
 	// Step 1: Normal steady-state reading before DST
-	pPre, debtPre := pc.ReadPublicInstant(baseTime, raw0)
+	pPre, debtPre, err := pc.ReadPublicInstant(baseTime, raw0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if pPre != baseTime || debtPre != 0 {
 		t.Fatalf("pre-DST read failed: p=%d debt=%d", pPre, debtPre)
 	}
@@ -218,7 +239,10 @@ func TestPublicClock_DSTFallBackAndSpringForward(t *testing.T) {
 		simRaw := raw0 + core.RawNanos(i*100)
 		simEst := fallBackEst + core.GstInstant(i*100)
 
-		p, debt := pc.ReadPublicInstant(simEst, simRaw)
+		p, debt, err := pc.ReadPublicInstant(simEst, simRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if p < prevP {
 			t.Fatalf("monotonicity violated during DST fall-back at iter %d: prev=%d curr=%d", i, prevP, p)
 		}
@@ -241,7 +265,10 @@ func TestPublicClock_DSTFallBackAndSpringForward(t *testing.T) {
 	// Step 3: Fast-forward elapsed time until estimate catches up with clamped public clock
 	catchUpRaw := raw0 + core.RawNanos(hourNs+1_000_000_000)
 	catchUpEst := baseTime + 1_000_000_000 // now 1 second past pre-DST value
-	pCaught, debtCaught := pc.ReadPublicInstant(catchUpEst, catchUpRaw)
+	pCaught, debtCaught, err := pc.ReadPublicInstant(catchUpEst, catchUpRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if pCaught <= pPre {
 		t.Fatalf("expected clock to advance after catching up: pPre=%d pCaught=%d", pPre, pCaught)
 	}
@@ -251,7 +278,10 @@ func TestPublicClock_DSTFallBackAndSpringForward(t *testing.T) {
 
 	// Step 4: DST "Spring Forward" (+1 hour step)
 	springForwardEst := catchUpEst + core.GstInstant(hourNs)
-	pSpring, debtSpring := pc.ReadPublicInstant(springForwardEst, catchUpRaw+1000)
+	pSpring, debtSpring, err := pc.ReadPublicInstant(springForwardEst, catchUpRaw+1000)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if pSpring < pCaught {
 		t.Fatalf("monotonicity violated on spring forward: pCaught=%d pSpring=%d", pCaught, pSpring)
 	}
@@ -266,7 +296,10 @@ func TestPublicClock_VMSnapshotRollbackAndConcurrency(t *testing.T) {
 	baseTime := core.GstInstant(1_700_000_000 * 1_000_000_000)
 
 	// Advance clock to high value
-	pMax, _ := pc.ReadPublicInstant(baseTime+10_000_000_000, 10_000_000_000)
+	pMax, _, err := pc.ReadPublicInstant(baseTime+10_000_000_000, 10_000_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Concurrent readers reading while VM snapshot rollback occurs
 	const goroutines = 20
@@ -281,7 +314,11 @@ func TestPublicClock_VMSnapshotRollbackAndConcurrency(t *testing.T) {
 				simRaw := core.RawNanos(rand.Uint64N(2_000_000_000))
 				simEst := baseTime - core.GstInstant(rand.Int64N(50_000_000_000))
 
-				p, _ := pc.ReadPublicInstant(simEst, simRaw)
+				p, _, err := pc.ReadPublicInstant(simEst, simRaw)
+				if err != nil {
+					t.Errorf("public read: %v", err)
+					break
+				}
 				if p < pMax {
 					t.Errorf("goroutine %d: public clock rolled backward below pMax: got %d < pMax %d", id, p, pMax)
 					break
@@ -316,7 +353,10 @@ func TestPublicClock_DSTHighFrequencyOscillations(t *testing.T) {
 		}
 		est := baseTime + core.GstInstant(i*1_000_000) + core.GstInstant(jitter)
 
-		p, _ := pc.ReadPublicInstant(est, raw)
+		p, _, err := pc.ReadPublicInstant(est, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if p < prevP {
 			t.Fatalf("monotonicity violated on oscillation at step %d: prev=%d curr=%d", i, prevP, p)
 		}

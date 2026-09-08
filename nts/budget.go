@@ -30,8 +30,11 @@ const (
 )
 
 var (
-	ErrInvalidCookie  = errors.New("nts cookie is empty or exceeds the packet budget")
-	ErrPacketTooLarge = errors.New("nts packet exceeds the UDP payload limit")
+	ErrInvalidCookie    = errors.New("nts cookie is empty or exceeds the packet budget")
+	ErrPacketTooLarge   = errors.New("nts packet exceeds the UDP payload limit")
+	errPlaceholderCount = errors.New("negative NTS cookie placeholder count")
+	errMissingAEAD      = errors.New("missing NTS AEAD")
+	errAEADParameters   = errors.New("invalid NTS AEAD nonce or tag size")
 )
 
 func validCookieSize(size int) bool {
@@ -50,14 +53,14 @@ func requestPlaceholderCount(cookieSize, requested int, aead cipher.AEAD) (int, 
 		return 0, ErrInvalidCookie
 	}
 	if requested < 0 {
-		return 0, errors.New("negative NTS cookie placeholder count")
+		return 0, errPlaceholderCount
 	}
 	if aead == nil {
-		return 0, errors.New("missing NTS AEAD")
+		return 0, errMissingAEAD
 	}
 	nonceSize, tagSize := aead.NonceSize(), aead.Overhead()
 	if nonceSize <= 0 || nonceSize > 65535 || tagSize <= 0 || tagSize > 65535 {
-		return 0, errors.New("invalid NTS AEAD nonce or tag size")
+		return 0, errAEADParameters
 	}
 	baseSize := 48 + 36 + 8 + paddedLength(nonceSize) + paddedLength(tagSize)
 	cookieFieldSize := 4 + paddedLength(cookieSize)
@@ -72,7 +75,7 @@ func requestPlaceholderCount(cookieSize, requested int, aead cipher.AEAD) (int, 
 // but neither malformed constructed fields nor re-encoding may evade the cap.
 func checkResponsePacketSize(header []byte, fields []ntp.ExtensionField) error {
 	if len(header) != 48 {
-		return errors.New("NTS requires a 48-byte NTP header")
+		return errNTPHeaderSize
 	}
 	total := len(header)
 	for _, field := range fields {

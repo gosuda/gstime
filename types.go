@@ -73,6 +73,7 @@ const (
 
 type TimeInterval = core.TimeInterval
 type AssuredNow = core.AssuredNow
+type AssuredUtcNow = core.AssuredUtcNow
 type PublicAssuredNow = core.PublicAssuredNow
 
 type RateFrac = core.RateFrac

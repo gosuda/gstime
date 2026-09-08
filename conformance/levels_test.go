@@ -2,10 +2,13 @@ package conformance
 
 import (
 	"context"
+	"errors"
+	"math"
 	"testing"
 	"time"
 
 	"gosuda.org/gstime"
+	"gosuda.org/gstime/assurance"
 	"gosuda.org/gstime/clock"
 	"gosuda.org/gstime/core"
 	"gosuda.org/gstime/ntp"
@@ -37,15 +40,20 @@ func TestConformance_LevelA_Wire(t *testing.T) {
 func TestConformance_LevelB_Estimate(t *testing.T) {
 	et := source.NewEstimateTrack()
 	for i := 0; i < 5; i++ {
-		et.AddSample(source.EstimateSample{
+		if err := et.AddSample(source.EstimateSample{
 			RawMid:                 core.RawNanos((i + 1) * 1_000_000_000),
 			PhaseErrorSlowPositive: 0.001 * float64(i),
 			RoundTripDelay:         0.01,
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	res, err := et.Fit()
 	if err != nil || res == nil {
 		t.Fatalf("Level B estimate failure: %v", err)
+	}
+	if math.Abs(res.PhaseEstimate-0.004) > 1e-12 || math.Abs(res.RateErrorEstimate-0.001) > 1e-12 {
+		t.Fatalf("Level B estimate: phase=%g rate=%g", res.PhaseEstimate, res.RateErrorEstimate)
 	}
 }
 
@@ -64,9 +72,17 @@ func TestConformance_LevelC_Assurance(t *testing.T) {
 
 func TestConformance_LevelD_Clock(t *testing.T) {
 	clk := clock.NewEstimateClock()
-	clk.InitializeAnchors(1_000_000_000, 100_000_000, 0)
-	val1, _ := clk.Evaluate(2_000_000_000)
-	val2, _ := clk.ReanchorContinuity(2_000_000_000, core.RateFromPpmEstimate(10.0), 0, clock.ChangeRateReanchor)
+	if err := clk.InitializeAnchors(1_000_000_000, 100_000_000, 0); err != nil {
+		t.Fatal(err)
+	}
+	val1, err := clk.Evaluate(2_000_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	val2, err := clk.ReanchorContinuity(2_000_000_000, core.RateFromPpmEstimate(10.0), 0, clock.ChangeRateReanchor)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if val1 != val2 {
 		t.Fatalf("Level D clock continuity failure: %d != %d", val1, val2)
 	}
@@ -78,12 +94,16 @@ func TestConformance_LevelE_Concurrency(t *testing.T) {
 	svc := gstime.NewClockService(raw, lh, [32]byte{1}, 32_000_000_000)
 
 	hull := core.TimeInterval{Earliest: 1_000_000_000, Latest: 2_000_000_000}
-	_ = svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_ = svc.CommitWait(ctx, 500_000_000, svc.Now().AssuranceEpochID, lh.ID, [32]byte{1})
+	if err := svc.CommitWait(ctx, 500_000_000, svc.Now().AssuranceEpochID, lh.ID, [32]byte{1}); err != nil {
+		t.Fatalf("certified past commit must complete: %v", err)
+	}
 }
 
 func TestConformance_LevelF_System(t *testing.T) {
@@ -93,7 +113,9 @@ func TestConformance_LevelF_System(t *testing.T) {
 
 	// Step 1: Synced
 	hull := core.TimeInterval{Earliest: 1_000_000_000, Latest: 2_000_000_000}
-	_ = svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 	if svc.Now().Status != core.StatusSynced {
 		t.Fatalf("Level F: expected StatusSynced")
 	}
@@ -101,7 +123,9 @@ func TestConformance_LevelF_System(t *testing.T) {
 	// Step 2: Fault injection (conflict)
 	raw.Advance(1_000_000_000)
 	disjoint := core.TimeInterval{Earliest: 50_000_000_000, Latest: 51_000_000_000}
-	_ = svc.PublishAssuranceRound(2_000_000_000, disjoint, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(2_000_000_000, disjoint, 1, 3, 2, 1, 100_000_000_000); !errors.Is(err, assurance.ErrAssuranceConflict) {
+		t.Fatalf("conflicting round: %v", err)
+	}
 	if svc.Now().Status != core.StatusDesync {
 		t.Fatalf("Level F: expected StatusDesync after conflict")
 	}

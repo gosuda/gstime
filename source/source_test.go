@@ -1,6 +1,7 @@
 package source
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -20,13 +21,15 @@ func TestWeightedRegressionPlantedPhaseAndRate(t *testing.T) {
 		x := float64(int64(raw)-int64(raw0+9*1_000_000_000)) / 1e9 // relative to newest
 		phase := plantedPhase + plantedRate*x
 
-		et.AddSample(EstimateSample{
+		if err := et.AddSample(EstimateSample{
 			RawMid:                 raw,
 			PhaseErrorSlowPositive: phase,
 			RoundTripDelay:         0.02,
 			RootDelay:              0.01,
 			RootDispersion:         0.005,
-		})
+		}); err != nil {
+			t.Fatalf("AddSample failed: %v", err)
+		}
 	}
 
 	res, err := et.Fit()
@@ -39,6 +42,178 @@ func TestWeightedRegressionPlantedPhaseAndRate(t *testing.T) {
 	}
 	if math.Abs(res.RateErrorEstimate-plantedRate) > 1e-9 {
 		t.Fatalf("rate estimate mismatch: got %e want %e", res.RateErrorEstimate, plantedRate)
+	}
+}
+
+func TestEstimateTrackRetainsRunsPassingSuffix(t *testing.T) {
+	et := NewEstimateTrack()
+	for i := range 20 {
+		phase := 0.0
+		if i >= 10 {
+			phase = 0.001
+		}
+		if err := et.AddSample(EstimateSample{
+			RawMid:                 core.RawNanos(i) * 1_000_000_000,
+			PhaseErrorSlowPositive: phase,
+		}); err != nil {
+			t.Fatalf("sample %d: %v", i, err)
+		}
+	}
+	first, err := et.Fit()
+	if err != nil {
+		t.Fatalf("initial Fit: %v", err)
+	}
+	if first.SampleCount != 11 || first.ResidualRunsPValue < DefaultRunsAlpha {
+		t.Fatalf("expected an 11-sample passing suffix, got %+v", first)
+	}
+	for i := 20; i < 30; i++ {
+		if err := et.AddSample(EstimateSample{
+			RawMid:                 core.RawNanos(i) * 1_000_000_000,
+			PhaseErrorSlowPositive: float64(i%2) * 0.001,
+		}); err != nil {
+			t.Fatalf("sample %d: %v", i, err)
+		}
+	}
+	second, err := et.Fit()
+	if err != nil {
+		t.Fatalf("Fit after new samples: %v", err)
+	}
+	if second.SampleCount > first.SampleCount+10 {
+		t.Fatalf("discarded samples revived: fit uses %d samples after retaining %d and adding 10", second.SampleCount, first.SampleCount)
+	}
+}
+
+func TestEstimateTrackRejectsNonfiniteSamplesWithoutRetainingThem(t *testing.T) {
+	cases := []struct {
+		name   string
+		sample EstimateSample
+	}{
+		{"nan-phase", EstimateSample{PhaseErrorSlowPositive: math.NaN()}},
+		{"infinite-phase", EstimateSample{PhaseErrorSlowPositive: math.Inf(1)}},
+		{"nan-round-trip", EstimateSample{RoundTripDelay: math.NaN()}},
+		{"infinite-round-trip", EstimateSample{RoundTripDelay: math.Inf(1)}},
+		{"nan-root-delay", EstimateSample{RootDelay: math.NaN()}},
+		{"infinite-root-delay", EstimateSample{RootDelay: math.Inf(-1)}},
+		{"nan-root-dispersion", EstimateSample{RootDispersion: math.NaN()}},
+		{"infinite-root-dispersion", EstimateSample{RootDispersion: math.Inf(1)}},
+		{"overflowing-distance", EstimateSample{RootDispersion: math.MaxFloat64, RootDelay: math.MaxFloat64}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			et := NewEstimateTrack()
+			if err := et.AddSample(EstimateSample{RawMid: 0}); err != nil {
+				t.Fatal(err)
+			}
+			tc.sample.RawMid = 1_000_000_000
+			if err := et.AddSample(tc.sample); !errors.Is(err, ErrInvalidEstimateSample) {
+				t.Fatalf("invalid sample: got %v, want ErrInvalidEstimateSample", err)
+			}
+			if err := et.AddSample(EstimateSample{RawMid: 2_000_000_000}); err != nil {
+				t.Fatal(err)
+			}
+			if res, err := et.Fit(); res != nil || !errors.Is(err, ErrNotEnoughSamples) {
+				t.Fatalf("two valid samples must not fit: result=%+v error=%v", res, err)
+			}
+			if err := et.AddSample(EstimateSample{RawMid: 3_000_000_000}); err != nil {
+				t.Fatal(err)
+			}
+			res, err := et.Fit()
+			if err != nil {
+				t.Fatalf("Fit after replacement sample: %v", err)
+			}
+			for name, value := range map[string]float64{
+				"phase":                       res.PhaseEstimate,
+				"rate":                        res.RateErrorEstimate,
+				"phase standard error":        res.PhaseStandardError,
+				"rate standard error":         res.RateStandardError,
+				"residual standard deviation": res.ResidualStandardDeviation,
+			} {
+				if value != 0 {
+					t.Errorf("%s = %g, want 0 for three zero-phase samples", name, value)
+				}
+			}
+			if res.SampleCount != 3 || res.ResidualRunsPValue != 1 {
+				t.Fatalf("invalid sample affected later fit: %+v", res)
+			}
+		})
+	}
+}
+
+func TestEstimateTrackRejectsUnstableRegression(t *testing.T) {
+	cases := []struct {
+		name    string
+		samples []EstimateSample
+		wantErr error
+	}{
+		{
+			name: "overflowing-weight-denominator",
+			samples: []EstimateSample{
+				{RawMid: 0},
+				{RawMid: 1_000_000_000},
+				{RawMid: 2_000_000_000, RootDispersion: math.MaxFloat64},
+			},
+			wantErr: ErrUnstableRegression,
+		},
+		{
+			name: "overflowing-regression-numerator",
+			samples: []EstimateSample{
+				{RawMid: 0},
+				{RawMid: 1_000_000_000, PhaseErrorSlowPositive: math.MaxFloat64},
+				{RawMid: 2_000_000_000},
+			},
+			wantErr: ErrUnstableRegression,
+		},
+		{
+			name: "overflowing-residual-variance",
+			samples: []EstimateSample{
+				{RawMid: 0, PhaseErrorSlowPositive: 1e200},
+				{RawMid: 1_000_000_000, PhaseErrorSlowPositive: -1e200},
+				{RawMid: 2_000_000_000, PhaseErrorSlowPositive: 1e200},
+			},
+			wantErr: ErrUnstableRegression,
+		},
+		{
+			name: "singular-nanosecond-design",
+			samples: []EstimateSample{
+				{RawMid: 0},
+				{RawMid: 1, RootDispersion: 1},
+				{RawMid: 2, RootDispersion: 100},
+			},
+			wantErr: ErrSingularDesignMatrix,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			et := NewEstimateTrack()
+			for _, sample := range tc.samples {
+				if err := et.AddSample(sample); err != nil {
+					t.Fatalf("finite sample rejected: %v", err)
+				}
+			}
+			if res, err := et.Fit(); res != nil || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Fit: result=%+v error=%v, want %v", res, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunsTestRejectsNonfiniteValues(t *testing.T) {
+	cases := []struct {
+		name      string
+		residuals []float64
+		model     float64
+	}{
+		{"nan-residual", []float64{0.01, math.NaN(), -0.01}, 1},
+		{"infinite-residual", []float64{0.01, math.Inf(1), -0.01}, 1},
+		{"nan-model", []float64{0.01, -0.01}, math.NaN()},
+		{"infinite-model", []float64{0.01, -0.01}, math.Inf(1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if p := ComputeRunsPValue(tc.residuals, tc.model); !math.IsNaN(p) {
+				t.Fatalf("invalid runs input returned p=%g, want NaN", p)
+			}
+		})
 	}
 }
 
@@ -59,11 +234,15 @@ func TestRunsTestRegimeChange(t *testing.T) {
 }
 
 func TestDeadbandZeroResidualsOmitted(t *testing.T) {
-	// Residuals within deadband should be omitted from sign sequence
-	residuals := []float64{0.01, 1e-12, -0.01}
-	p := ComputeRunsPValue(residuals, 1.0)
-	if p <= 0 {
-		t.Fatalf("unexpected p-value with tiny middle residual: %f", p)
+	residuals := []float64{0.01, -0.01, 0.01, -0.01, 0.01, -0.01, 0.01, -0.01, 0.01, -0.01}
+	withTinyResiduals := make([]float64, 0, 2*len(residuals))
+	for _, r := range residuals {
+		withTinyResiduals = append(withTinyResiduals, r, 1e-12)
+	}
+	want := ComputeRunsPValue(residuals, 1.0)
+	got := ComputeRunsPValue(withTinyResiduals, 1.0)
+	if math.IsNaN(got) || math.Abs(got-want) > 1e-12 {
+		t.Fatalf("deadband residuals changed runs p-value: got %g want %g", got, want)
 	}
 }
 

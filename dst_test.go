@@ -26,7 +26,8 @@ type DSTSimulator struct {
 	leapHistoryID    [32]byte
 }
 
-func newDSTSimulator(seed int64) *DSTSimulator {
+func newDSTSimulator(t *testing.T, seed int64) *DSTSimulator {
+	t.Helper()
 	rng := rand.New(rand.NewSource(seed))
 	startRaw := core.RawNanos(10_000_000_000)
 	startPhysical := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
@@ -37,12 +38,17 @@ func newDSTSimulator(seed int64) *DSTSimulator {
 	uppScale := core.RateScale(core.OneQ48 + core.RateFromPpmUpper(200.0))
 	rawClock.SetScaleEnvelope(lowScale, uppScale)
 
-	lh, _ := core.NewLeapHistory(10, nil)
+	lh, err := core.NewLeapHistory(10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var cfgID [32]byte
 	cfgID[0] = 0xAA
 
 	svc := gstime.NewClockService(rawClock, lh, cfgID, 32_000_000_000)
-	_ = svc.InitializeEstimate(startRaw, startPhysical, 0)
+	if err := svc.InitializeEstimate(startRaw, startPhysical, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	sim := &DSTSimulator{
 		seed:             seed,
@@ -57,11 +63,12 @@ func newDSTSimulator(seed int64) *DSTSimulator {
 	}
 
 	// Publish initial valid round
-	sim.publishConsensusRound(false)
+	sim.publishConsensusRound(t, false)
 	return sim
 }
 
-func (sim *DSTSimulator) publishConsensusRound(byzantine bool) {
+func (sim *DSTSimulator) publishConsensusRound(t *testing.T, byzantine bool) {
+	t.Helper()
 	nowRaw := sim.raw.Read().Raw
 	validUntil := nowRaw + 10_000_000_000 // 10s horizon
 
@@ -93,18 +100,23 @@ func (sim *DSTSimulator) publishConsensusRound(byzantine bool) {
 	}
 
 	consensus, err := source.ComputeAssuranceConsensus(intervals, 1, 3, 2, 0, 0)
-	if err == nil {
-		center := (consensus.Hull.Earliest + consensus.Hull.Latest) / 2
-		_ = sim.svc.InitializeEstimate(nowRaw, center, 0)
-		_ = sim.svc.PublishAssuranceRound(
-			nowRaw,
-			consensus.Hull,
-			1,
-			uint32(len(intervals)),
-			2,
-			uint32(len(consensus.Components)),
-			validUntil,
-		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	center := consensus.Hull.Earliest + (consensus.Hull.Latest-consensus.Hull.Earliest)/2
+	if err := sim.svc.InitializeEstimate(nowRaw, center, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := sim.svc.PublishAssuranceRound(
+		nowRaw,
+		consensus.Hull,
+		1,
+		uint32(len(intervals)),
+		2,
+		uint32(len(consensus.Components)),
+		validUntil,
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -157,7 +169,7 @@ func (sim *DSTSimulator) Step(t *testing.T, step int) {
 	// 4. Periodically publish fresh consensus round or reprobe
 	if step%10 == 0 {
 		byzantineFaulty := sim.rng.Float64() < 0.5
-		sim.publishConsensusRound(byzantineFaulty)
+		sim.publishConsensusRound(t, byzantineFaulty)
 	}
 
 	// 5. Invariant Checking
@@ -201,7 +213,7 @@ func TestDST_ClockStabilityAndVMSnapshotJumps(t *testing.T) {
 
 	for _, seed := range seeds {
 		t.Run("Seed", func(t *testing.T) {
-			sim := newDSTSimulator(seed)
+			sim := newDSTSimulator(t, seed)
 			for step := 1; step <= totalStepsPerSeed; step++ {
 				sim.Step(t, step)
 			}
@@ -216,7 +228,7 @@ func TestDST_Reproducibility(t *testing.T) {
 	const steps = 200
 
 	runSim := func() []gstime.GstInstant {
-		sim := newDSTSimulator(testSeed)
+		sim := newDSTSimulator(t, testSeed)
 		trace := make([]gstime.GstInstant, steps)
 		for i := 0; i < steps; i++ {
 			sim.Step(t, i+1)

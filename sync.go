@@ -24,6 +24,21 @@ import (
 	"gosuda.org/gstime/source"
 )
 
+var (
+	errNilService          = errors.New("clock service cannot be nil")
+	errNoSources           = errors.New("configuration has no upstream sources")
+	errEngineClosed        = errors.New("sync engine is closed")
+	errEngineRunning       = errors.New("sync engine is already running")
+	errRawChanged          = errors.New("raw clock changed during query round")
+	errLocalLeap           = errors.New("local estimate is in a leap second")
+	errUnsupportedResponse = errors.New("unsupported, unsynchronized, or leap-announcing NTP response")
+	errLeapBoundary        = errors.New("NTP interval crosses an ambiguous leap boundary")
+	errALPN                = errors.New("NTS-KE ALPN was not negotiated")
+	errNoCookies           = errors.New("NTS-KE supplied no usable cookies")
+	errOriginMismatch      = errors.New("NTP origin does not match request")
+	errMappingChanged      = errors.New("estimate step during NTP exchange")
+)
+
 // SourceQuerier abstracts network interactions for NTP/NTS queries.
 // Implementations must acquire fresh evidence during this round, on the supplied
 // service raw clock and its current continuity/scale envelope. Cached results
@@ -72,31 +87,47 @@ type SyncEngine struct {
 	pollIntvl    time.Duration
 	queryTimeout time.Duration
 
-	pollMu  sync.Mutex
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	cancel  context.CancelFunc
-	running atomic.Bool
-	closed  atomic.Bool
+	pollMu           sync.Mutex
+	mu               sync.Mutex
+	wg               sync.WaitGroup
+	cancel           context.CancelFunc
+	running          atomic.Bool
+	lifetime         context.Context
+	shutdown         context.CancelFunc
+	done             chan struct{}
+	estimates        map[string]*endpointEstimate
+	reference        clock.EstimateMapping
+	referenceToken   uint64
+	referenceStep    core.Generation
+	controlTarget    core.GstInstant
+	hasControlTarget bool
+	closed           atomic.Bool
 }
 
 // NewSyncEngine initializes a new SyncEngine for the given configuration and ClockService.
 func NewSyncEngine(cfg config.Config, svc *ClockService, opts ...SyncOption) (*SyncEngine, error) {
 	if svc == nil {
-		return nil, errors.New("clock service cannot be nil")
+		return nil, errNilService
 	}
-	if err := cfg.Validate(); err != nil {
+	id, err := cfg.ConfigID()
+	if err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 	if len(cfg.Sources) == 0 {
-		return nil, errors.New("configuration has no upstream sources")
+		return nil, errNoSources
 	}
+	if id != svc.configID || cfg.Assurance.MaxWidthNs != svc.assuranceClock.Snapshot().MaxAssuranceWidthNs {
+		return nil, ErrConfigurationMismatch
+	}
+	cfg.Sources = append([]config.SourceConfig(nil), cfg.Sources...)
+	lifetime, shutdown := context.WithCancel(context.Background())
 
 	engine := &SyncEngine{
 		cfg:          cfg,
 		svc:          svc,
 		pollIntvl:    2 * time.Second,
 		queryTimeout: 1500 * time.Millisecond,
+		lifetime:     lifetime, shutdown: shutdown, done: make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -104,7 +135,9 @@ func NewSyncEngine(cfg config.Config, svc *ClockService, opts ...SyncOption) (*S
 	}
 
 	if engine.querier == nil {
-		engine.querier = newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, svc.leapHistory, engine.queryTimeout)
+		querier := newDefaultSourceQuerier(svc.rawClock, svc.estimateClock, svc.leapHistory, engine.queryTimeout)
+		querier.service = svc
+		engine.querier = querier
 	}
 
 	return engine, nil
@@ -117,10 +150,10 @@ func (e *SyncEngine) Start(ctx context.Context) error {
 	defer e.mu.Unlock()
 
 	if e.closed.Load() {
-		return errors.New("sync engine is closed")
+		return errEngineClosed
 	}
 	if e.running.Swap(true) {
-		return errors.New("sync engine is already running")
+		return errEngineRunning
 	}
 
 	subCtx, cancel := context.WithCancel(ctx)
@@ -136,18 +169,19 @@ func (e *SyncEngine) Start(ctx context.Context) error {
 // It guarantees zero goroutine leaks upon return.
 func (e *SyncEngine) Close() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if e.closed.Swap(true) {
+		e.mu.Unlock()
+		<-e.done
 		return nil
 	}
-
+	e.shutdown()
 	if e.cancel != nil {
 		e.cancel()
 	}
-
+	e.mu.Unlock()
 	e.wg.Wait()
 	e.running.Store(false)
+	close(e.done)
 	return nil
 }
 
@@ -178,13 +212,24 @@ func (e *SyncEngine) loop(ctx context.Context) {
 
 // PollOnce executes a single parallel query round across configured sources and publishes consensus.
 func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return errEngineClosed
+	}
+	e.wg.Add(1)
+	e.mu.Unlock()
+	defer e.wg.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(e.lifetime, cancel)
+	defer func() { stop(); cancel() }()
 	e.pollMu.Lock()
 	defer e.pollMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if e.closed.Load() {
-		return errors.New("sync engine is closed")
 	}
 	defer func() {
 		// Parent cancellation or engine shutdown is not a failed evidence round.
@@ -198,6 +243,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 
 	type sourceResult struct {
 		domain string
+		source config.SourceConfig
 		res    *ntp.MeasurementResult
 		err    error
 	}
@@ -214,14 +260,14 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 
 			tNow := e.svc.rawClock.Read().Raw
 			res, err := e.querier.QuerySource(pollCtx, s, tNow)
-			results <- sourceResult{domain: s.FaultDomainID, res: res, err: err}
+			results <- sourceResult{domain: s.FaultDomainID, source: s, res: res, err: err}
 		}(src)
 	}
 
 	wg.Wait()
 	close(results)
 	if e.closed.Load() {
-		return errors.New("sync engine is closed")
+		return errEngineClosed
 	}
 
 	// Every interval must refer to this same reading, not to its individual RawMid.
@@ -231,19 +277,24 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if reading.ContinuityToken != startReading.ContinuityToken || reading.BackendGeneration != startReading.BackendGeneration || nowRaw < startReading.Raw || currentLow != scaleLow || currentUpp != scaleUpp {
-		return errors.New("raw clock changed during query round")
+	sameDomain := startReading.ContinuityToken != 0 && reading.ContinuityToken == startReading.ContinuityToken && reading.BackendGeneration == startReading.BackendGeneration
+	sameScale := currentLow == scaleLow && currentUpp == scaleUpp
+	if !sameDomain || !sameScale || nowRaw < startReading.Raw {
+		return errRawChanged
 	}
 	maxAge := e.cfg.Assurance.MaxAgeNs
-	if maxAge <= 0 {
-		maxAge = 10 * 1_000_000_000
-	}
 	if uint64(nowRaw) > math.MaxUint64-uint64(maxAge) {
 		return core.ErrOverflow
 	}
 	byDomain := make(map[string][]core.TimeInterval)
+	var samples []roundMeasurement
+	var queryErrors []error
 	for r := range results {
-		if r.err != nil || r.res == nil || r.domain == "" {
+		if r.err != nil {
+			queryErrors = append(queryErrors, fmt.Errorf("query %s: %w", r.source.Endpoint, r.err))
+			continue
+		}
+		if r.res == nil || r.domain == "" {
 			continue
 		}
 		if r.res.RawMid < startReading.Raw || r.res.RawMid > nowRaw || nowRaw-r.res.RawMid > core.RawNanos(maxAge) {
@@ -259,6 +310,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 			continue
 		}
 		byDomain[r.domain] = append(byDomain[r.domain], inv)
+		samples = append(samples, roundMeasurement{source: r.source, result: r.res})
 	}
 	var domains []string
 	for domain := range byDomain {
@@ -266,10 +318,12 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	}
 	sort.Strings(domains)
 	var intervals []core.TimeInterval
+	eligible := make(map[string]bool, len(domains))
 	for _, domain := range domains {
 		consolidated := source.ConsolidateDomainIntervals(core.FaultDomainID(domain), byDomain[domain])
 		if !consolidated.Inconsistent {
 			intervals = append(intervals, consolidated.Interval)
+			eligible[domain] = true
 		}
 	}
 
@@ -279,7 +333,7 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	}
 
 	if len(intervals) < minDomains {
-		return fmt.Errorf("insufficient voting domains: got %d, required %d", len(intervals), minDomains)
+		return errors.Join(fmt.Errorf("insufficient voting domains: got %d, required %d", len(intervals), minDomains), errors.Join(queryErrors...))
 	}
 
 	faultBudget := e.cfg.Assurance.FaultBudget
@@ -287,24 +341,34 @@ func (e *SyncEngine) PollOnce(ctx context.Context) (pollErr error) {
 	if minHonest <= 0 {
 		minHonest = 1
 	}
+	target, rate, err := e.selectControl(reading, intervals, samples, eligible)
+	if err != nil {
+		return err
+	}
+	prior := target
+	if e.hasControlTarget {
+		prior = e.controlTarget
+	}
 
 	consensus, err := source.ComputeAssuranceConsensus(
 		intervals,
 		faultBudget,
 		minDomains,
 		minHonest,
-		0,
-		0,
+		prior,
+		target,
 	)
 	if err != nil {
 		return fmt.Errorf("consensus computation failed: %w", err)
 	}
 
 	validUntilRaw := nowRaw + core.RawNanos(maxAge)
-	err = e.svc.publishSyncRound(reading, scaleLow, scaleUpp, consensus, validUntilRaw)
+	err = e.svc.publishSyncRound(reading, scaleLow, scaleUpp, consensus, rate, validUntilRaw)
 	if err != nil {
 		return fmt.Errorf("failed to publish assurance round: %w", err)
 	}
+	e.controlTarget, e.hasControlTarget = consensus.ControlTarget, true
+	e.referenceStep = e.svc.estimateClock.Snapshot().StepGeneration
 
 	return nil
 }
@@ -316,6 +380,7 @@ type defaultSourceQuerier struct {
 	timeout     time.Duration
 	ntsMu       sync.Mutex
 	ntsState    map[string]*ntsSession
+	service     *ClockService
 }
 
 type ntsSession struct {
@@ -346,78 +411,88 @@ func (q *defaultSourceQuerier) QuerySource(ctx context.Context, src config.Sourc
 
 // localUnixEstimate applies the same leap policy and wall-clock fallback to
 // send and receive readings in both acquisition transports.
-func (q *defaultSourceQuerier) localUnixEstimate(raw core.RawNanos) (int64, error) {
-	var unix int64
+func (q *defaultSourceQuerier) localUnixEstimate(raw core.RawNanos) (int64, clock.EstimateMapping, error) {
+	var mapping clock.EstimateMapping
 	if q.estClock != nil {
-		snap := q.estClock.Snapshot()
-		if est, err := snap.Evaluate(raw); err == nil && est > 0 {
-			projection := q.leapHistory.GstInstantToUnixProjection(est)
-			if projection.IsLeapSecond {
-				return 0, errors.New("local estimate is in a leap second")
+		var err error
+		mapping, err = q.estClock.MappingAt(raw)
+		if err != nil && !errors.Is(err, core.ErrUnanchored) {
+			return 0, mapping, err
+		}
+		if err == nil {
+			estimate, err := mapping.Evaluate(raw)
+			if err != nil {
+				return 0, mapping, err
 			}
-			unix = int64(projection.Nanos)
+			projection := q.leapHistory.GstInstantToUnixProjection(estimate)
+			if projection.IsLeapSecond {
+				return 0, mapping, errLocalLeap
+			}
+			return int64(projection.Nanos), mapping, nil
+		}
+		mapping = q.estClock.Snapshot()
+		if mapping.Anchored {
+			return 0, mapping, errMappingChanged
 		}
 	}
-	return cmp.Or(unix, time.Now().UnixNano()), nil
+	return time.Now().UnixNano(), mapping, nil
 }
 
-func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (*ntp.MeasurementResult, error) {
+func (q *defaultSourceQuerier) queryNTP(ctx context.Context, endpoint string) (result *ntp.MeasurementResult, queryErr error) {
 	d := net.Dialer{Timeout: q.timeout}
-	conn, err := d.DialContext(ctx, "udp", endpoint)
+	address := endpoint
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		address = net.JoinHostPort(address, "123")
+	}
+	conn, err := d.DialContext(ctx, "udp", address)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(q.timeout))
+	defer func() { queryErr = closeQuery(ctx, conn, queryErr) }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if err := setQueryDeadline(ctx, conn, q.timeout); err != nil {
+		return nil, err
 	}
-
-	req := ntp.Packet{
-		Version: 4,
-		Mode:    3,
-		Poll:    6,
-	}
-	reqBytes := req.Encode()
-
-	r1 := q.rawClock.Read()
-	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	req, err := newNTPRequest()
 	if err != nil {
 		return nil, err
 	}
-
-	_, err = conn.Write(reqBytes)
+	request := req.Encode()
+	send, err := q.captureStamp()
 	if err != nil {
 		return nil, err
 	}
-
-	buf := make([]byte, 1024)
+	slot := ntp.RequestSlot{EndpointID: endpoint, BasicTransmitWire: req.TxTimestamp, LocalSend: send}
+	if _, err := conn.Write(request); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, nts.MaxPacketSize+1)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err
 	}
-
-	r4 := q.rawClock.Read()
-	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	received, err := q.captureStamp()
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := ntp.ParsePacket(buf[:n])
+	if n > nts.MaxPacketSize {
+		return nil, nts.ErrPacketTooLarge
+	}
+	response, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
 		return nil, err
 	}
-
-	if isKoD, code := ntp.IsKissOfDeath(resp); isKoD {
+	if response.OrigTimestamp != slot.BasicTransmitWire {
+		return nil, errOriginMismatch
+	}
+	if isKoD, code := ntp.IsKissOfDeath(response); isKoD {
 		return nil, fmt.Errorf("kiss-of-death received: %s", code)
 	}
-
-	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
+	return q.measureResponse(response, slot.LocalSend, received)
 }
 
-func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceConfig) (*ntp.MeasurementResult, error) {
+func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceConfig) (result *ntp.MeasurementResult, queryErr error) {
 	q.ntsMu.Lock()
 	sess, ok := q.ntsState[src.Endpoint]
 	if !ok || sess.jar.NeedsReplenishment() {
@@ -430,156 +505,155 @@ func (q *defaultSourceQuerier) queryNTS(ctx context.Context, src config.SourceCo
 		q.ntsState[src.Endpoint] = sess
 	}
 	q.ntsMu.Unlock()
-
 	cookie, err := sess.jar.AcquireForRequest(false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire NTS cookie: %w", err)
 	}
-
+	defer sess.jar.MarkSpent(cookie.ID)
 	d := net.Dialer{Timeout: q.timeout}
-	udpEndpoint := sess.udpEndpoint
-
-	conn, err := d.DialContext(ctx, "udp", udpEndpoint)
+	conn, err := d.DialContext(ctx, "udp", sess.udpEndpoint)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(q.timeout))
+	defer func() { queryErr = closeQuery(ctx, conn, queryErr) }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if err := setQueryDeadline(ctx, conn, q.timeout); err != nil {
+		return nil, err
 	}
-
-	reqHeader := ntp.Packet{
-		Version: 4,
-		Mode:    3,
-		Poll:    6,
-	}
-	headerBytes := reqHeader.Encode()
-
-	placeholders := sess.jar.CalculatePlaceholderCount()
-	extBytes, uniqueID, err := nts.BuildProtectedRequest(headerBytes, cookie.Bytes, placeholders, sess.c2sAead, sess.c2sKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build NTS protected request: %w", err)
-	}
-
-	fullPacket := append(headerBytes, extBytes...)
-
-	r1 := q.rawClock.Read()
-	t1Unix, err := q.localUnixEstimate(r1.Raw)
+	req, err := newNTPRequest()
 	if err != nil {
 		return nil, err
 	}
-
-	_, err = conn.Write(fullPacket)
+	header := req.Encode()
+	extensions, uid, err := nts.BuildProtectedRequest(header, cookie.Bytes, sess.jar.CalculatePlaceholderCount(), sess.c2sAead, sess.c2sKey)
+	if err != nil {
+		return nil, fmt.Errorf("build protected NTS request: %w", err)
+	}
+	request := append(header, extensions...)
+	send, err := q.captureStamp()
 	if err != nil {
 		return nil, err
 	}
-
-	// One extra byte prevents accepting a valid-looking prefix of an oversized
-	// datagram. The buffer covers authenticated replacement cookies as well.
+	slot := ntp.RequestSlot{EndpointID: sess.udpEndpoint, BasicTransmitWire: req.TxTimestamp, LocalSend: send, NtsUniqueID: uid, NtsCookieID: cookie.ID}
+	if _, err := conn.Write(request); err != nil {
+		return nil, err
+	}
 	buf := make([]byte, nts.MaxPacketSize+1)
 	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	received, err := q.captureStamp()
 	if err != nil {
 		return nil, err
 	}
 	if n > nts.MaxPacketSize {
 		return nil, nts.ErrPacketTooLarge
 	}
-
-	if n < 48 {
-		return nil, errors.New("response packet too short for NTP header")
-	}
-
-	r4 := q.rawClock.Read()
-	t4Unix, err := q.localUnixEstimate(r4.Raw)
+	response, err := ntp.ParsePacket(buf[:n])
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := ntp.ParsePacket(buf[:n])
+	if response.OrigTimestamp != slot.BasicTransmitWire {
+		return nil, errOriginMismatch
+	}
+	fields, trailing, err := ntp.ParseExtensionFields(buf[ntp.HeaderSize:n])
 	if err != nil {
 		return nil, err
 	}
-
-	extFields, _, err := ntp.ParseExtensionFields(buf[48:n])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse extension fields: %w", err)
+	if len(trailing) != 0 {
+		return nil, ntp.ErrMalformedExtension
 	}
-
-	newCookies, err := nts.VerifyAndDecryptResponse(buf[:48], extFields, uniqueID, sess.s2cAead)
+	cookies, err := nts.VerifyAndDecryptResponse(buf[:ntp.HeaderSize], fields, slot.NtsUniqueID, sess.s2cAead)
 	if err != nil {
 		return nil, fmt.Errorf("NTS response verification failed: %w", err)
 	}
 	sess.jar.MarkSpent(cookie.ID)
-	if len(newCookies) > 0 {
-		sess.jar.AddCookies(newCookies)
-	}
-
-	return q.measureResponse(resp, r1, r4, t1Unix, t4Unix)
+	sess.jar.AddCookies(cookies)
+	return q.measureResponse(response, slot.LocalSend, received)
 }
 
-func (q *defaultSourceQuerier) measureResponse(resp *ntp.Packet, r1, r4 clock.RawReading, t1Unix, t4Unix int64) (*ntp.MeasurementResult, error) {
-	t1Raw, t4Raw := r1.Raw, r4.Raw
+func (q *defaultSourceQuerier) measureResponse(resp *ntp.Packet, send, received ntp.Stamp) (*ntp.MeasurementResult, error) {
 	if resp.Version != 4 || resp.Mode != 4 || resp.Stratum < 1 || resp.Stratum > 15 || resp.LeapIndicator != 0 {
-		return nil, errors.New("unsupported, unsynchronized, or leap-announcing NTP response")
+		return nil, errUnsupportedResponse
 	}
-	coarseSec := time.Now().Unix()
+	sameDomain := send.ContinuityToken != 0 && send.ContinuityToken == received.ContinuityToken && send.BackendGeneration == received.BackendGeneration
+	sameScale := send.RawScaleLower == received.RawScaleLower && send.RawScaleUpper == received.RawScaleUpper
+	if !sameDomain || !sameScale || received.Raw < send.Raw {
+		return nil, errRawChanged
+	}
+	if send.StepGeneration != received.StepGeneration || send.EstimateAnchored != received.EstimateAnchored {
+		return nil, errMappingChanged
+	}
+	coarse := q.leapHistory.GstInstantToUnixProjection(send.Estimate)
+	coarseSec := core.FloorDiv(int64(coarse.Nanos), 1_000_000_000)
 	t2Unix, err := ntp.UnfoldTimestamp(resp.RecvTimestamp, coarseSec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T2: %w", err)
+		return nil, err
 	}
 	t3Unix, err := ntp.UnfoldTimestamp(resp.TxTimestamp, coarseSec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unfold T3: %w", err)
+		return nil, err
 	}
-
 	if err := q.checkUnixInterval(t2Unix, t3Unix); err != nil {
 		return nil, err
 	}
-	measIn := ntp.MeasurementInput{
-		LocalSendRaw:                t1Raw,
-		LocalRecvRaw:                t4Raw,
-		T1LocalSendEstimate:         core.GstInstant(t1Unix),
-		T2ServerRecv:                core.GstInstant(t2Unix),
-		T3ServerTx:                  core.GstInstant(t3Unix),
-		T4LocalRecvEstimate:         core.GstInstant(t4Unix),
-		LocalEstimateAtMid:          core.GstInstant(t1Unix + (t4Unix-t1Unix)/2),
-		ServerRootDelayNs:           resp.RootDelayNanoseconds(),
-		ServerRootDispersionNs:      resp.RootDispersionNanoseconds(),
-		LocalSendReadError:          core.ErrorNs(r1.ReadBound),
-		LocalRecvReadError:          core.ErrorNs(r4.ReadBound),
-		RemoteTimestampQuantization: 1000,
-		LocalMappingIntegrationErr:  1000,
-		StaticAsymmetryCorrection:   0,
-		StaticAsymmetryUncertainty:  0,
-		PrecisionFloorNs:            1000,
-		MaxServerTurnaroundNs:       2_000_000_000,
-		MaxRootDistanceNs:           16_000_000_000,
-	}
-
-	m, err := ntp.ComputeMeasurement(measIn)
+	t2, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(t2Unix))
 	if err != nil {
 		return nil, err
 	}
-	if err := q.checkUnixInterval(int64(m.HardInterval.Earliest), int64(m.HardInterval.Latest)); err != nil {
-		return nil, err
-	}
-	lo, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Earliest))
+	t3, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(t3Unix))
 	if err != nil {
 		return nil, err
 	}
-	hi, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.HardInterval.Latest))
+	mid := send.Raw + (received.Raw-send.Raw)/2
+	var estimateAtMid core.GstInstant
+	if send.EstimateAnchored {
+		mapping, err := q.estClock.MappingAt(mid)
+		if err != nil || mapping.StepGeneration != send.StepGeneration {
+			return nil, errors.Join(errMappingChanged, err)
+		}
+		estimateAtMid, err = mapping.Evaluate(mid)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if received.Raw-send.Raw > math.MaxInt64 {
+			return nil, core.ErrOverflow
+		}
+		estimateAtMid, err = core.CheckedInstantAdd(send.Estimate, int64(mid-send.Raw))
+		if err != nil {
+			return nil, err
+		}
+		received.Estimate, err = core.CheckedInstantAdd(send.Estimate, int64(received.Raw-send.Raw))
+		if err != nil {
+			return nil, err
+		}
+	}
+	m, err := ntp.ComputeMeasurement(ntp.MeasurementInput{
+		LocalSendRaw: send.Raw, LocalRecvRaw: received.Raw,
+		RawScaleLower: send.RawScaleLower, RawScaleUpper: send.RawScaleUpper,
+		T1LocalSendEstimate: send.Estimate, T2ServerRecv: t2, T3ServerTx: t3, T4LocalRecvEstimate: received.Estimate,
+		LocalEstimateAtMid: estimateAtMid,
+		ServerRootDelayNs:  resp.RootDelayNanoseconds(), ServerRootDispersionNs: resp.RootDispersionNanoseconds(),
+		LocalSendReadError: send.RawReadBound, LocalRecvReadError: received.RawReadBound,
+		RemoteTimestampQuantization: 1000, ProtocolConversionError: 1,
+		LocalMappingIntegrationErr: send.EstimateReadError + received.EstimateReadError,
+		PrecisionFloorNs:           1000, MaxServerTurnaroundNs: 2_000_000_000, MaxRootDistanceNs: 16_000_000_000,
+	})
 	if err != nil {
 		return nil, err
 	}
-	center, err := q.leapHistory.UnixNanosToGstInstant(core.UnixNanos(m.Center))
-	if err != nil {
+	lo := q.leapHistory.GstInstantToUnixProjection(m.HardInterval.Earliest)
+	hi := q.leapHistory.GstInstantToUnixProjection(m.HardInterval.Latest)
+	if lo.IsLeapSecond || hi.IsLeapSecond {
+		return nil, errLeapBoundary
+	}
+	if err := q.checkUnixInterval(int64(lo.Nanos), int64(hi.Nanos)); err != nil {
 		return nil, err
 	}
-	m.HardInterval = core.TimeInterval{Earliest: lo, Latest: hi}
-	m.Center = center
+	m.HasEstimate = send.EstimateAnchored
 	return m, nil
 }
 
@@ -593,7 +667,7 @@ func (q *defaultSourceQuerier) checkUnixInterval(lo, hi int64) error {
 	first, last := core.FloorDiv(lo, 1_000_000_000), core.FloorDiv(hi, 1_000_000_000)
 	for _, e := range q.leapHistory.Entries {
 		if e.TransitionUnixSecond != math.MinInt64 && first <= e.TransitionUnixSecond && last >= e.TransitionUnixSecond-1 {
-			return errors.New("NTP interval crosses an ambiguous leap boundary")
+			return errLeapBoundary
 		}
 	}
 	return nil
@@ -625,7 +699,7 @@ func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint stri
 	conn := connection.(*tls.Conn)
 	cs := conn.ConnectionState()
 	if cs.NegotiatedProtocol != "ntske/1" {
-		return nil, errors.New("NTS-KE ALPN was not negotiated")
+		return nil, errALPN
 	}
 	offered := []uint16{15, 30}
 	if _, err := conn.Write(nts.BuildClientRequest(offered, true)); err != nil {
@@ -656,7 +730,7 @@ func (q *defaultSourceQuerier) negotiateNTSKE(ctx context.Context, endpoint stri
 	}
 	jar := nts.NewCookieJar()
 	if jar.AddCookies(response.Cookies) == 0 {
-		return nil, errors.New("NTS-KE supplied no usable cookies")
+		return nil, errNoCookies
 	}
 	return &ntsSession{c2sKey: c2sKey, s2cKey: s2cKey, c2sAead: c2sAead, s2cAead: s2cAead, jar: jar,
 		udpEndpoint: net.JoinHostPort(udpHost, strconv.Itoa(int(response.Port)))}, nil

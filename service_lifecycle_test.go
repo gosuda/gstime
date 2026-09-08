@@ -12,20 +12,26 @@ import (
 	"gosuda.org/gstime/ntp"
 )
 
+var errRegressionUnavailable = errors.New("fixture: upstream unavailable")
+
 type regressionUnavailableQuerier struct{}
 
 func (regressionUnavailableQuerier) QuerySource(context.Context, config.SourceConfig, core.RawNanos) (*ntp.MeasurementResult, error) {
-	return nil, errors.New("fixture: upstream unavailable")
+	return nil, errRegressionUnavailable
 }
 
-func regressionAnchoredService(t *testing.T) (*clock.SimulatedRawClock, *gstime.ClockService) {
+func regressionAnchoredService(t *testing.T, cfg config.Config) (*clock.SimulatedRawClock, *gstime.ClockService) {
 	t.Helper()
 	raw := clock.NewSimulatedRawClock(1_000_000_000)
 	lh, err := core.NewLeapHistory(10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := gstime.NewClockService(raw, lh, [32]byte{}, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 	if err := svc.InitializeEstimate(1_000_000_000, 100_000_000_000, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -38,11 +44,11 @@ func regressionAnchoredService(t *testing.T) (*clock.SimulatedRawClock, *gstime.
 }
 
 func TestRegressionFailedPollMustEnterHoldover(t *testing.T) {
-	_, svc := regressionAnchoredService(t)
 	cfg := config.DefaultConfig()
 	cfg.Sources = []config.SourceConfig{
 		{FaultDomainID: "a", Endpoint: "a"}, {FaultDomainID: "b", Endpoint: "b"}, {FaultDomainID: "c", Endpoint: "c"},
 	}
+	_, svc := regressionAnchoredService(t, cfg)
 	engine, err := gstime.NewSyncEngine(cfg, svc, gstime.WithSourceQuerier(regressionUnavailableQuerier{}))
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +67,7 @@ func TestRegressionFailedPollMustEnterHoldover(t *testing.T) {
 func TestRegressionDesyncMustBeConsistentAcrossAPIs(t *testing.T) {
 	for _, failure := range []string{"expired", "continuity_changed"} {
 		t.Run(failure, func(t *testing.T) {
-			raw, svc := regressionAnchoredService(t)
+			raw, svc := regressionAnchoredService(t, config.DefaultConfig())
 			before := svc.Now()
 			if failure == "expired" {
 				raw.Advance(2_000_000_000)

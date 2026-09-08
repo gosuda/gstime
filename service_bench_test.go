@@ -79,6 +79,6 @@ func BenchmarkNowUtc(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _, _, _, _ = svc.NowUtc(lhID)
+		_, _ = svc.NowUtc(lhID)
 	}
 }

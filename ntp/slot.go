@@ -13,6 +13,13 @@ type Stamp struct {
 	EstimateReadError     core.ErrorNs
 	MappingGeneration     core.Generation
 	PublicationGeneration core.Generation
+	StepGeneration        core.Generation
+	EstimateAnchored      bool
+	ContinuityToken       uint64
+	BackendGeneration     uint64
+	RawReadBound          core.ErrorNs
+	RawScaleLower         core.RateScale
+	RawScaleUpper         core.RateScale
 }
 
 // RequestSlot holds binding state for an outstanding NTP request.

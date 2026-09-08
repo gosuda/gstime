@@ -26,6 +26,34 @@ var (
 	errSingularRate = errors.New("rate composition denominator is zero")
 )
 
+// CheckedInstantAdd rejects a signed nanosecond sum outside the instant range.
+func CheckedInstantAdd(base GstInstant, delta int64) (GstInstant, error) {
+	overflowsUpper := delta > 0 && int64(base) > math.MaxInt64-delta
+	overflowsLower := delta < 0 && int64(base) < math.MinInt64-delta
+	if overflowsUpper || overflowsLower {
+		return 0, ErrOverflow
+	}
+	return base + GstInstant(delta), nil
+}
+
+// SymmetricEpsilon includes both endpoints and saturates unrepresentable bounds.
+func SymmetricEpsilon(center GstInstant, interval TimeInterval, extra ErrorNs) ErrorNs {
+	if interval.Earliest > interval.Latest {
+		return ErrorInfinity
+	}
+	distance := func(a, b GstInstant) uint64 {
+		if a >= b {
+			return uint64(a) - uint64(b)
+		}
+		return uint64(b) - uint64(a)
+	}
+	radius := max(distance(center, interval.Earliest), distance(center, interval.Latest))
+	if uint64(extra) >= uint64(ErrorInfinity)-radius {
+		return ErrorInfinity
+	}
+	return ErrorNs(radius) + extra
+}
+
 // RateFromPpmEstimate converts parts-per-million to RateFrac with round-to-nearest.
 func RateFromPpmEstimate(ppm float64) RateFrac {
 	val := ppm * float64(OneQ48) / 1e6

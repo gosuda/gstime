@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"gosuda.org/gstime/core"
 )
@@ -15,6 +16,7 @@ var (
 	ErrContinuityTokenMismatch = errors.New("raw continuity token mismatch without bridge")
 	ErrAssuranceConflict       = errors.New("empty intersection between old propagated bound and new hull")
 	ErrBoundTooWide            = errors.New("assurance interval width exceeds maximum cap")
+	ErrNoAnchor                = errors.New("no anchor available")
 )
 
 // AssuranceAnchor represents an immutable published absolute anchor (Section 4.15).
@@ -45,10 +47,35 @@ type AssuranceState struct {
 	Status                 core.SyncStatus
 	Reason                 core.StatusReason
 	LastSuccessfulRoundRaw core.RawNanos
-	PastWatermark          core.GstInstant
+	watermark              *atomic.Int64
 	Generation             core.Generation
 	AssuranceEpochID       [16]byte
 	MaxAssuranceWidthNs    int64
+	leapHistoryID          [32]byte
+	configID               [32]byte
+}
+
+func (s AssuranceState) PastWatermark() core.GstInstant {
+	if s.watermark == nil {
+		return core.GstInstant(math.MinInt64)
+	}
+	return core.GstInstant(s.watermark.Load())
+}
+
+// AdvanceWatermark requires a lower endpoint from a currently valid interval.
+func (s AssuranceState) AdvanceWatermark(lower core.GstInstant) core.GstInstant {
+	if s.watermark == nil {
+		return lower
+	}
+	for {
+		previous := s.watermark.Load()
+		if int64(lower) <= previous {
+			return core.GstInstant(previous)
+		}
+		if s.watermark.CompareAndSwap(previous, int64(lower)) {
+			return lower
+		}
+	}
 }
 
 // PropagateAnchor evaluates the absolute assurance interval at raw instant r (Section 6.2).
@@ -62,7 +89,7 @@ func PropagateAnchor(
 	maxAssuranceWidthNs int64,
 ) (core.TimeInterval, error) {
 	if anchor == nil {
-		return core.TimeInterval{}, errors.New("no anchor available")
+		return core.TimeInterval{}, ErrNoAnchor
 	}
 	if r < anchor.RawAnchor {
 		return core.TimeInterval{}, ErrRawEarlierThanAnchor
@@ -70,7 +97,7 @@ func PropagateAnchor(
 	if r > anchor.ValidUntilRaw {
 		return core.TimeInterval{}, ErrAnchorExpired
 	}
-	if continuityToken != anchor.ContinuityToken {
+	if continuityToken == 0 || continuityToken != anchor.ContinuityToken {
 		return core.TimeInterval{}, ErrContinuityTokenMismatch
 	}
 
@@ -162,6 +189,8 @@ func NewAssuranceClock(maxAssuranceWidthNs int64) *AssuranceClock {
 	}
 	var epochID [16]byte
 	_, _ = rand.Read(epochID[:])
+	watermark := new(atomic.Int64)
+	watermark.Store(math.MinInt64)
 
 	return &AssuranceClock{
 		state: AssuranceState{
@@ -170,7 +199,7 @@ func NewAssuranceClock(maxAssuranceWidthNs int64) *AssuranceClock {
 			Generation:          1,
 			AssuranceEpochID:    epochID,
 			MaxAssuranceWidthNs: maxAssuranceWidthNs,
-			PastWatermark:       -1 << 62,
+			watermark:           watermark,
 		},
 	}
 }
@@ -180,6 +209,12 @@ func (ac *AssuranceClock) Snapshot() AssuranceState {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
 	return ac.state
+}
+
+func (ac *AssuranceClock) startEpoch() {
+	_, _ = rand.Read(ac.state.AssuranceEpochID[:])
+	ac.state.watermark = new(atomic.Int64)
+	ac.state.watermark.Store(math.MinInt64)
 }
 
 // ValidateHull checks ordering and the full width without signed subtraction.
@@ -216,54 +251,48 @@ func (ac *AssuranceClock) ProcessFullRound(
 	if err := ValidateHull(hull, ac.state.MaxAssuranceWidthNs); err != nil {
 		return nil, err
 	}
+	if validUntilRaw < rSel {
+		return nil, ErrAnchorExpired
+	}
+	if continuityToken == 0 {
+		return nil, ErrContinuityTokenMismatch
+	}
+	if scaleLower <= 0 || scaleUpper < scaleLower || rawReadBound > math.MaxInt64/2 {
+		return nil, core.ErrInvalidRange
+	}
+	identityChanged := ac.state.leapHistoryID != leapHistoryID || ac.state.configID != configID
+	if ac.state.Status != core.StatusUnanchored && identityChanged {
+		ac.startEpoch()
+	}
 	publishedInterval := hull
 
 	// If an existing valid anchor exists on matching domains, compute intersection
 	if ac.state.Status == core.StatusSynced || ac.state.Status == core.StatusHoldover {
-		if isAnchorMatching(ac.state.Anchor, leapHistoryID, configID, continuityToken, scaleLower, scaleUpper) {
-
-			oldPropagated, err := PropagateAnchor(
-				ac.state.Anchor,
-				rSel,
-				rawReadBound,
-				continuityToken,
-				ac.state.LowerDebt,
-				ac.state.UpperDebt,
-				ac.state.MaxAssuranceWidthNs,
-			)
-
-			if err == nil {
-				// Intersect propagated old bound with new hull (Section 6.4)
-				intEarliest := publishedInterval.Earliest
-				if oldPropagated.Earliest > intEarliest {
-					intEarliest = oldPropagated.Earliest
-				}
-				intLatest := publishedInterval.Latest
-				if oldPropagated.Latest < intLatest {
-					intLatest = oldPropagated.Latest
-				}
-
-				if intEarliest > intLatest {
-					// ASSURANCE_CONFLICT: empty intersection
+		if !isAnchorMatching(ac.state.Anchor, leapHistoryID, configID, continuityToken, scaleLower, scaleUpper) {
+			if !identityChanged {
+				ac.startEpoch()
+			}
+		} else {
+			oldPropagated, err := PropagateAnchor(ac.state.Anchor, rSel, rawReadBound,
+				continuityToken, ac.state.LowerDebt, ac.state.UpperDebt, ac.state.MaxAssuranceWidthNs)
+			if err != nil {
+				ac.startEpoch()
+			} else {
+				publishedInterval.Earliest = max(publishedInterval.Earliest, oldPropagated.Earliest)
+				publishedInterval.Latest = min(publishedInterval.Latest, oldPropagated.Latest)
+				if publishedInterval.Earliest > publishedInterval.Latest {
 					ac.state.Status = core.StatusDesync
 					ac.state.Reason = core.ReasonAssuranceConflict
 					ac.state.Anchor = nil
 					ac.state.Generation++
+					ac.startEpoch()
 					return nil, ErrAssuranceConflict
-				}
-
-				publishedInterval = core.TimeInterval{
-					Earliest: intEarliest,
-					Latest:   intLatest,
 				}
 			}
 		}
 	}
 
-	// Update certified past watermark: max(previousWatermark, L) (Section 6.9)
-	if publishedInterval.Earliest > ac.state.PastWatermark {
-		ac.state.PastWatermark = publishedInterval.Earliest
-	}
+	ac.state.AdvanceWatermark(publishedInterval.Earliest)
 
 	newAnchor := &AssuranceAnchor{
 		RawAnchor:         rSel,
@@ -290,6 +319,8 @@ func (ac *AssuranceClock) ProcessFullRound(
 	ac.state.Status = core.StatusSynced
 	ac.state.Reason = core.ReasonNone
 	ac.state.LastSuccessfulRoundRaw = rSel
+	ac.state.leapHistoryID = leapHistoryID
+	ac.state.configID = configID
 	ac.state.Generation++
 
 	return &publishedInterval, nil
@@ -326,6 +357,7 @@ func (ac *AssuranceClock) TransitionToDesync(reason core.StatusReason) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 
+	ac.startEpoch()
 	ac.state.Status = core.StatusDesync
 	ac.state.Reason = reason
 	ac.state.Anchor = nil

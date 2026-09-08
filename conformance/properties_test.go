@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -21,12 +22,17 @@ func TestP1_ReanchorContinuity(t *testing.T) {
 	clk := clock.NewEstimateClock()
 	raw0 := core.RawNanos(10_000_000_000)
 	time0 := core.GstInstant(1_700_000_000 * 1_000_000_000)
-	clk.InitializeAnchors(raw0, time0, 0)
+	if err := clk.InitializeAnchors(raw0, time0, 0); err != nil {
+		t.Fatal(err)
+	}
 
 	currRaw := raw0
 	for i := 0; i < 50_000; i++ {
 		currRaw += core.RawNanos(rand.Uint64N(500_000_000))
-		before, _ := clk.Evaluate(currRaw)
+		before, err := clk.Evaluate(currRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		newRate := core.RateFromPpmEstimate(-300.0 + rand.Float64()*600.0)
 		debt := core.PhaseNs(rand.Int64N(10_000) - 5_000)
@@ -35,7 +41,10 @@ func TestP1_ReanchorContinuity(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reanchor failed: %v", err)
 		}
-		after, _ := clk.Evaluate(currRaw)
+		after, err := clk.Evaluate(currRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if before != after || before != reanchorVal {
 			t.Fatalf("P1 violation at iter %d: before=%d after=%d", i, before, after)
@@ -47,11 +56,21 @@ func TestP1_ReanchorContinuity(t *testing.T) {
 func TestP2_DebtAccrualNoInstantStep(t *testing.T) {
 	clk := clock.NewEstimateClock()
 	raw0 := core.RawNanos(5_000_000_000)
-	clk.InitializeAnchors(raw0, 100_000_000_000, 0)
+	if err := clk.InitializeAnchors(raw0, 100_000_000_000, 0); err != nil {
+		t.Fatal(err)
+	}
 
-	before, _ := clk.Evaluate(raw0)
-	_, _ = clk.ReanchorContinuity(raw0, 0, 1_000_000_000, clock.ChangeSlewReplan) // +1s debt
-	after, _ := clk.Evaluate(raw0)
+	before, err := clk.Evaluate(raw0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clk.ReanchorContinuity(raw0, 0, 1_000_000_000, clock.ChangeSlewReplan); err != nil {
+		t.Fatal(err)
+	}
+	after, err := clk.Evaluate(raw0)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if before != after {
 		t.Fatalf("P2 violation: clock stepped on debt accrual: before=%d after=%d", before, after)
@@ -116,12 +135,16 @@ func TestP5_AssuranceIndependentOfEstimateStatistics(t *testing.T) {
 	svc := gstime.NewClockService(raw, lh, [32]byte{1}, 32_000_000_000)
 
 	hull := core.TimeInterval{Earliest: 1_000_000_000, Latest: 2_000_000_000}
-	_ = svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	now1 := svc.Now()
 
 	// Alter estimate track with arbitrary phase & rate changes
-	_ = svc.InitializeEstimate(1_000_000_000, 999_999_999_000, core.RateFromPpmEstimate(100.0))
+	if err := svc.InitializeEstimate(1_000_000_000, 999_999_999_000, core.RateFromPpmEstimate(100.0)); err != nil {
+		t.Fatal(err)
+	}
 
 	now2 := svc.Now()
 
@@ -187,7 +210,7 @@ func TestP7_PastWatermarkMonotonic(t *testing.T) {
 			t.Fatalf("round %d failed: %v", i, err)
 		}
 
-		currWm := ac.Snapshot().PastWatermark
+		currWm := ac.Snapshot().PastWatermark()
 		if currWm < lastWm {
 			t.Fatalf("P7 violation: watermark decreased from %d to %d", lastWm, currWm)
 		}
@@ -290,15 +313,19 @@ func TestP12_CommitWaitStrictlyAfterLatest(t *testing.T) {
 
 	// Initial round
 	hull := core.TimeInterval{Earliest: 5_000_000_000, Latest: 5_000_100_000}
-	_ = svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_000_000_000, hull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// 1. When commitTs <= current watermark, CommitWait completes immediately
-	wm0, _, _ := svc.PastWatermark(svc.Now().AssuranceEpochID, lh.ID, cfgID)
-	err := svc.CommitWait(ctx, wm0-1, svc.Now().AssuranceEpochID, lh.ID, cfgID)
+	// CommitWait completes when the watermark is strictly past the commit.
+	wm0, _, err := svc.PastWatermark(svc.Now().AssuranceEpochID, lh.ID, cfgID)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.CommitWait(ctx, wm0-1, svc.Now().AssuranceEpochID, lh.ID, cfgID); err != nil {
 		t.Fatalf("CommitWait for past timestamp failed: %v", err)
 	}
 
@@ -319,7 +346,9 @@ func TestP12_CommitWaitStrictlyAfterLatest(t *testing.T) {
 	// Advance watermark strictly past commitTs
 	raw.Advance(100_000_000)
 	nextHull := core.TimeInterval{Earliest: 5_100_050_000, Latest: 5_100_150_000}
-	_ = svc.PublishAssuranceRound(1_100_000_000, nextHull, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_100_000_000, nextHull, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	// Wait for CommitWait completion
 	select {
@@ -332,7 +361,10 @@ func TestP12_CommitWaitStrictlyAfterLatest(t *testing.T) {
 	}
 
 	// Verify watermark at completion is strictly greater than commitTs
-	wm, _, _ := svc.PastWatermark(svc.Now().AssuranceEpochID, lh.ID, cfgID)
+	wm, _, err := svc.PastWatermark(svc.Now().AssuranceEpochID, lh.ID, cfgID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if wm <= commitTs {
 		t.Fatalf("P12 violation: CommitWait completed with watermark %d <= commitTs %d", wm, commitTs)
 	}
@@ -370,12 +402,16 @@ func TestP14_DesyncReturnsNoFiniteAssuredInterval(t *testing.T) {
 
 	// Trigger conflict to enter DESYNC
 	hull1 := core.TimeInterval{Earliest: 1_000_000_000, Latest: 2_000_000_000}
-	_ = svc.PublishAssuranceRound(1_000_000_000, hull1, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(1_000_000_000, hull1, 1, 3, 2, 1, 100_000_000_000); err != nil {
+		t.Fatal(err)
+	}
 
 	raw.Advance(1_000_000_000)
 	// Disjoint hull -> ASSURANCE_CONFLICT -> DESYNC
 	hullDisjoint := core.TimeInterval{Earliest: 9_000_000_000, Latest: 10_000_000_000}
-	_ = svc.PublishAssuranceRound(2_000_000_000, hullDisjoint, 1, 3, 2, 1, 100_000_000_000)
+	if err := svc.PublishAssuranceRound(2_000_000_000, hullDisjoint, 1, 3, 2, 1, 100_000_000_000); !errors.Is(err, assurance.ErrAssuranceConflict) {
+		t.Fatalf("conflicting round: %v", err)
+	}
 
 	nowDesync := svc.Now()
 	if nowDesync.Status != core.StatusDesync {

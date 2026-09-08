@@ -87,7 +87,7 @@ func TestRegressionNTPMustConvertUnixToGstTimescale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, utc, _, err := svc.NowUtc(lh.ID)
+	utc, err := svc.NowUtc(lh.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

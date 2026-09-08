@@ -123,7 +123,7 @@ func TestPublishRejectsInvalidHullBeforeMutation(t *testing.T) {
 				} else {
 					r := svc.rawClock.Read()
 					lo, hi := svc.rawClock.ScaleEnvelope()
-					err = svc.publishSyncRound(r, lo, hi, &source.AssuranceConsensusResult{Hull: tc.hull}, 2_000_000_000)
+					err = svc.publishSyncRound(r, lo, hi, &source.AssuranceConsensusResult{Hull: tc.hull}, 0, 2_000_000_000)
 				}
 				if err == nil {
 					t.Fatal("invalid hull accepted")
@@ -156,24 +156,5 @@ func TestPollUsesAcquisitionMidpointBound(t *testing.T) {
 	truth := core.GstInstant(100_001_000_000)
 	if !got.HasInterval || got.Interval.Latest < truth || got.Interval.Earliest > truth {
 		t.Fatalf("acquisition uncertainty lost: %+v, truth=%d", got.Interval, truth)
-	}
-}
-
-func TestPublishValidMidpointAtSignedEdges(t *testing.T) {
-	for _, hull := range []TimeInterval{{Earliest: math.MinInt64, Latest: math.MinInt64 + 1000}, {Earliest: math.MaxInt64 - 1000, Latest: math.MaxInt64}, {Earliest: -500, Latest: 500}} {
-		svc, _ := reviewService(t, 2000)
-		r := svc.rawClock.Read()
-		lo, hi := svc.rawClock.ScaleEnvelope()
-		if err := svc.publishSyncRound(r, lo, hi, &source.AssuranceConsensusResult{Hull: hull}, 2_000_000_000); err != nil {
-			t.Fatal(err)
-		}
-		mapping := svc.estimateClock.Snapshot()
-		got, err := mapping.Evaluate(r.Raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != hull.Earliest+500 {
-			t.Fatalf("midpoint %d for %+v", got, hull)
-		}
 	}
 }

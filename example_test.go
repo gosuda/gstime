@@ -12,30 +12,53 @@ import (
 	"gosuda.org/gstime/ntp"
 )
 
-func newTestService(rawNow core.RawNanos, target gstime.GstInstant) *gstime.ClockService {
+func newSimulatedExampleService(rawNow core.RawNanos, target gstime.GstInstant) *gstime.ClockService {
 	rawClock := clock.NewSimulatedRawClock(rawNow)
-	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
-	cfgID[0] = 0x01
+	lh, err := core.NewLeapHistory(10, nil)
+	if err != nil {
+		panic(err)
+	}
+	cfg := simulatedExampleConfig()
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		panic(err)
+	}
 
-	svc := gstime.NewClockService(rawClock, lh, cfgID, 32_000_000_000)
-	_ = svc.InitializeEstimate(rawNow, target, 0)
+	svc := gstime.NewClockService(rawClock, lh, cfgID, cfg.Assurance.MaxWidthNs)
+	if err := svc.InitializeEstimate(rawNow, target, 0); err != nil {
+		panic(err)
+	}
 	hull := core.TimeInterval{Earliest: target - 50_000, Latest: target + 50_000}
-	_ = svc.PublishAssuranceRound(rawNow, hull, 1, 4, 3, 1, rawNow+100_000_000_000)
+	if err := svc.PublishAssuranceRound(rawNow, hull, 1, 3, 2, 1, rawNow+100_000_000_000); err != nil {
+		panic(err)
+	}
 	return svc
 }
 
-// Example_configuration demonstrates defining multi-domain NTS and NTP sources.
+func simulatedExampleConfig() config.Config {
+	cfg := config.DefaultConfig()
+	cfg.Sources = []config.SourceConfig{
+		{FaultDomainID: "a", Endpoint: "a.example:123"},
+		{FaultDomainID: "b", Endpoint: "b.example:123"},
+		{FaultDomainID: "c", Endpoint: "c.example:123"},
+	}
+	return cfg
+}
+
+// Example_configuration uses placeholder endpoints; operators must select unsmeared sources and independent fault domains.
 func Example_configuration() {
 	cfg := config.DefaultConfig()
 	cfg.Sources = []config.SourceConfig{
-		{FaultDomainID: "cloudflare", Endpoint: "time.cloudflare.com:4460", NTS: true},
-		{FaultDomainID: "google", Endpoint: "time.google.com:123", NTS: false},
-		{FaultDomainID: "apple", Endpoint: "time.apple.com:123", NTS: false},
-		{FaultDomainID: "meta", Endpoint: "time.facebook.com:123", NTS: false},
+		{FaultDomainID: "a", Endpoint: "a.example:4460", NTS: true},
+		{FaultDomainID: "b", Endpoint: "b.example:123"},
+		{FaultDomainID: "c", Endpoint: "c.example:123"},
+		{FaultDomainID: "d", Endpoint: "d.example:123"},
 	}
 
-	cfgID, _ := cfg.ConfigID()
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		panic(err)
+	}
 	fmt.Printf("Sources: %d, HasConfigID: %t\n", len(cfg.Sources), len(cfgID) == 32)
 	// Output:
 	// Sources: 4, HasConfigID: true
@@ -43,7 +66,7 @@ func Example_configuration() {
 
 // ExampleClockService_NowPublicAssured demonstrates querying monotonic presentation time.
 func ExampleClockService_NowPublicAssured() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 
 	pub := svc.NowPublicAssured()
 	fmt.Printf("Status: %s, HasEpsilon: %t\n", pub.Status, pub.PublicSymmetricEpsilon > 0)
@@ -51,9 +74,9 @@ func ExampleClockService_NowPublicAssured() {
 	// Status: SYNCED, HasEpsilon: true
 }
 
-// ExampleClockService_Now demonstrates obtaining a certified GSTimeAssure true-time interval.
+// ExampleClockService_Now reads an assured interval from simulated evidence.
 func ExampleClockService_Now() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 
 	now := svc.Now()
 	fmt.Printf("Status: %s, HasInterval: %t\n", now.Status, now.HasInterval)
@@ -63,10 +86,9 @@ func ExampleClockService_Now() {
 
 // ExampleClockService_CommitWait demonstrates external consistency commit wait.
 func ExampleClockService_CommitWait() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 	now := svc.Now()
 
-	// Commit timestamp selected within the certified interval
 	commitTs := now.Interval.Earliest - 1000
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -80,9 +102,8 @@ func ExampleClockService_CommitWait() {
 
 // ExampleClockService_After demonstrates non-blocking tri-state causality and lock lease validation.
 func ExampleClockService_After() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 
-	// Past timestamp check
 	pastTime := gstime.GstInstant(1_700_000_000_000_000_000 - 1_000_000)
 	decision, status, _ := svc.After(pastTime)
 
@@ -93,18 +114,21 @@ func ExampleClockService_After() {
 
 // ExampleClockService_NowUtc demonstrates civil calendrical time formatting.
 func ExampleClockService_NowUtc() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 	now := svc.Now()
 
-	_, _, est, status, _ := svc.NowUtc(now.LeapHistoryID)
-	fmt.Printf("Status: %s, ValidDate: %t\n", status, est.Date.Year > 2020)
+	utc, err := svc.NowUtc(now.LeapHistoryID)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Status: %s, ValidDate: %t\n", utc.Status, utc.HasEstimate && utc.Estimate.Date.Year > 2020)
 	// Output:
 	// Status: SYNCED, ValidDate: true
 }
 
 // ExampleClockService_NowUnixProjection demonstrates legacy POSIX timestamp projection.
 func ExampleClockService_NowUnixProjection() {
-	svc := newTestService(1_000_000_000, 1_700_000_000_000_000_000)
+	svc := newSimulatedExampleService(1_000_000_000, 1_700_000_000_000_000_000)
 
 	proj, err := svc.NowUnixProjection()
 	fmt.Printf("Err: %v, IsLeapSecond: %t\n", err, proj.IsLeapSecond)
@@ -115,49 +139,58 @@ func ExampleClockService_NowUnixProjection() {
 // Example_vmMigrationLockDetection demonstrates fail-fast detection of VM pause / anchor expiration.
 func Example_vmMigrationLockDetection() {
 	raw := clock.NewSimulatedRawClock(1_000_000_000)
-	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	lh, err := core.NewLeapHistory(10, nil)
+	if err != nil {
+		panic(err)
+	}
+	cfg := simulatedExampleConfig()
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		panic(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	nowRaw := raw.Read().Raw
 	target := gstime.GstInstant(1_700_000_000_000_000_000)
-	_ = svc.InitializeEstimate(nowRaw, target, 0)
+	if err := svc.InitializeEstimate(nowRaw, target, 0); err != nil {
+		panic(err)
+	}
 	hull := core.TimeInterval{Earliest: target - 100, Latest: target + 100}
 
 	// Anchor valid for only 5 seconds of raw time
-	_ = svc.PublishAssuranceRound(nowRaw, hull, 1, 3, 2, 1, nowRaw+5_000_000_000)
+	if err := svc.PublishAssuranceRound(nowRaw, hull, 1, 3, 2, 1, nowRaw+5_000_000_000); err != nil {
+		panic(err)
+	}
 
 	// Simulate VM suspend/migration: raw time jumps forward by 2 hours
 	raw.Advance(7200 * 1_000_000_000)
 
-	// Immediate fail-fast detection: anchor expired
 	now := svc.Now()
 	fmt.Printf("AfterVMSuspend: %s, Reason: %s\n", now.Status, now.Reason)
 	// Output:
 	// AfterVMSuspend: DESYNC, Reason: BOUND_TOO_OLD
 }
 
-// Example_syncEngineBackgroundPolling demonstrates background NTP polling with leak-free lifecycle management.
+// Example_syncEngineBackgroundPolling uses simulated measurements, not production acquisition.
 func Example_syncEngineBackgroundPolling() {
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
-	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
-
-	cfg := config.DefaultConfig()
-	cfg.Sources = []config.SourceConfig{
-		{FaultDomainID: "cloudflare", Endpoint: "time.cloudflare.com:123", NTS: false},
-		{FaultDomainID: "google", Endpoint: "time.google.com:123", NTS: false},
-		{FaultDomainID: "apple", Endpoint: "time.apple.com:123", NTS: false},
+	lh, err := core.NewLeapHistory(10, nil)
+	if err != nil {
+		panic(err)
 	}
-
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfg := simulatedExampleConfig()
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		panic(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
 	mock := &mockQuerier{
 		results: map[string]*ntp.MeasurementResult{
-			"time.cloudflare.com:123": newMockMeasurement(targetTime, 10_000_000, 10_000_000_000),
-			"time.google.com:123":     newMockMeasurement(targetTime, 12_000_000, 10_000_000_000),
-			"time.apple.com:123":      newMockMeasurement(targetTime, 15_000_000, 10_000_000_000),
+			"a.example:123": newMockMeasurement(targetTime, 10_000_000, 10_000_000_000),
+			"b.example:123": newMockMeasurement(targetTime, 12_000_000, 10_000_000_000),
+			"c.example:123": newMockMeasurement(targetTime, 15_000_000, 10_000_000_000),
 		},
 	}
 
@@ -166,16 +199,18 @@ func Example_syncEngineBackgroundPolling() {
 		panic(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	// Start background polling daemon
-	_ = engine.Start(ctx)
+	defer func() {
+		if err := engine.Close(); err != nil {
+			panic(err)
+		}
+	}()
+	if err := engine.Start(ctx); err != nil {
+		panic(err)
+	}
 
-	// Best Practice: Always defer engine.Close() to stop polling goroutine and prevent goroutine leaks
-	defer engine.Close()
-
-	// WaitSync blocks until initial synchronization is achieved
 	if err := engine.WaitSync(ctx); err != nil {
 		panic(err)
 	}

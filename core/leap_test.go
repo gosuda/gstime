@@ -2,14 +2,20 @@ package core
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"math"
 	"testing"
+	"time"
 )
 
 func TestLeapHistoryCanonicalEncodingAndValidation(t *testing.T) {
 	// 1972-07-01 00:00:00 UTC transition (78796800)
 	entries := []LeapEntry{
 		{TransitionUnixSecond: 78796800, Delta: 1},
-		{TransitionUnixSecond: 94694400, Delta: 1}, // 1973-01-01
+		{TransitionUnixSecond: 94694400, Delta: -1}, // 1973-01-01
 	}
 
 	lh, err := NewLeapHistory(10, entries)
@@ -17,9 +23,16 @@ func TestLeapHistoryCanonicalEncodingAndValidation(t *testing.T) {
 		t.Fatalf("NewLeapHistory failed: %v", err)
 	}
 
+	wantCanonical, err := hex.DecodeString("4753544c310000000a000000020000000004b2580001000000000000000000000005a4ec00ff00000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
 	canon := lh.CanonicalBytes()
-	if !bytes.HasPrefix(canon, []byte("GSTL1")) {
-		t.Fatalf("expected GSTL1 prefix")
+	if !bytes.Equal(canon, wantCanonical) {
+		t.Fatalf("canonical bytes = %x; want %x", canon, wantCanonical)
+	}
+	if wantID := sha256.Sum256(wantCanonical); lh.ID != wantID {
+		t.Fatalf("canonical digest = %x; want %x", lh.ID, wantID)
 	}
 
 	parsed, err := ParseLeapHistory(canon)
@@ -32,33 +45,40 @@ func TestLeapHistoryCanonicalEncodingAndValidation(t *testing.T) {
 	if len(parsed.Entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(parsed.Entries))
 	}
+	if !bytes.Equal(parsed.CanonicalBytes(), wantCanonical) {
+		t.Fatalf("parsed canonical bytes = %x; want %x", parsed.CanonicalBytes(), wantCanonical)
+	}
+	label := UtcLabel{Date: GregorianDate{Year: 1973, Month: 1, Day: 1}, LeapHistoryID: parsed.ID}
+	if got, err := parsed.UtcToGstInstant(label); err != nil || got != 94694400000000000 {
+		t.Fatalf("parsed mixed-sign history conversion = %d, %v; want 94694400000000000", got, err)
+	}
 }
 
 func TestLeapHistoryRejections(t *testing.T) {
 	// Unsorted
 	_, err := NewLeapHistory(10, []LeapEntry{
-		{TransitionUnixSecond: 100, Delta: 1},
-		{TransitionUnixSecond: 50, Delta: 1},
+		{TransitionUnixSecond: 172800, Delta: 1},
+		{TransitionUnixSecond: 86400, Delta: 1},
 	})
-	if err == nil {
-		t.Fatalf("expected error for unsorted entries")
+	if !errors.Is(err, ErrUnsortedLeapTransitions) {
+		t.Fatalf("unsorted entries: got %v; want ErrUnsortedLeapTransitions", err)
 	}
 
 	// Duplicate
 	_, err = NewLeapHistory(10, []LeapEntry{
-		{TransitionUnixSecond: 100, Delta: 1},
-		{TransitionUnixSecond: 100, Delta: 1},
+		{TransitionUnixSecond: 86400, Delta: 1},
+		{TransitionUnixSecond: 86400, Delta: 1},
 	})
-	if err == nil {
-		t.Fatalf("expected error for duplicate entry")
+	if !errors.Is(err, ErrDuplicateLeapTransition) {
+		t.Fatalf("duplicate entry: got %v; want ErrDuplicateLeapTransition", err)
 	}
 
 	// Invalid delta
 	_, err = NewLeapHistory(10, []LeapEntry{
-		{TransitionUnixSecond: 100, Delta: 2},
+		{TransitionUnixSecond: 86400, Delta: 2},
 	})
-	if err == nil {
-		t.Fatalf("expected error for invalid delta")
+	if !errors.Is(err, ErrInvalidLeapDelta) {
+		t.Fatalf("invalid delta: got %v; want ErrInvalidLeapDelta", err)
 	}
 }
 
@@ -130,5 +150,33 @@ func TestGstInstantToUtcAcrossLeapSecond(t *testing.T) {
 	projAfter := lh.GstInstantToUnixProjection(tAfter)
 	if projAfter.IsLeapSecond {
 		t.Fatalf("expected IsLeapSecond false in projection")
+	}
+}
+
+func TestLeapHistoryRejectsInvalidTransitions(t *testing.T) {
+	valid, err := NewLeapHistory(10, []LeapEntry{{TransitionUnixSecond: 0, Delta: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		second int64
+	}{
+		{"not midnight", 1},
+		{"unrepresentable future date", math.MaxInt64 / 86400 * 86400},
+		{"unrepresentable past date", math.MinInt64 / 86400 * 86400},
+		{"unrepresentable previous date", time.Date(math.MinInt32, 1, 1, 0, 0, 0, 0, time.UTC).Unix()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewLeapHistory(10, []LeapEntry{{TransitionUnixSecond: tc.second, Delta: 1}})
+			if !errors.Is(err, ErrInvalidLeapTransition) {
+				t.Errorf("NewLeapHistory transition %d: got %v; want ErrInvalidLeapTransition", tc.second, err)
+			}
+			encoded := valid.CanonicalBytes()
+			binary.BigEndian.PutUint64(encoded[13:21], uint64(tc.second))
+			if _, err := ParseLeapHistory(encoded); !errors.Is(err, ErrInvalidLeapTransition) {
+				t.Errorf("ParseLeapHistory transition %d: got %v; want ErrInvalidLeapTransition", tc.second, err)
+			}
+		})
 	}
 }

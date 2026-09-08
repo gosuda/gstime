@@ -13,12 +13,15 @@ func TestLocalUnixEstimateConversion(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name  string
-		label core.UtcLabel
-		leap  bool
+		name     string
+		label    core.UtcLabel
+		leap     bool
+		wantUnix int64
 	}{
-		{"ordinary", core.UtcLabel{Date: core.GregorianDate{Year: 2024, Month: 1, Day: 1}, LeapHistoryID: lh.ID}, false},
-		{"leap", core.UtcLabel{Date: core.GregorianDate{Year: 2016, Month: 12, Day: 31}, SecondOfDay: 86400, LeapHistoryID: lh.ID}, true},
+		{"ordinary", core.UtcLabel{Date: core.GregorianDate{Year: 2024, Month: 1, Day: 1}, LeapHistoryID: lh.ID}, false, 1_704_067_200_000_000_000},
+		{"zero", core.UtcLabel{Date: core.GregorianDate{Year: 1970, Month: 1, Day: 1}, LeapHistoryID: lh.ID}, false, 0},
+		{"negative", core.UtcLabel{Date: core.GregorianDate{Year: 1969, Month: 12, Day: 31}, SecondOfDay: 86399, LeapHistoryID: lh.ID}, false, -1_000_000_000},
+		{"leap", core.UtcLabel{Date: core.GregorianDate{Year: 2016, Month: 12, Day: 31}, SecondOfDay: 86400, LeapHistoryID: lh.ID}, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			target, err := lh.UtcToGstInstant(tc.label)
@@ -26,24 +29,26 @@ func TestLocalUnixEstimateConversion(t *testing.T) {
 				t.Fatal(err)
 			}
 			ec := clock.NewEstimateClock()
-			ec.InitializeAnchors(1000, target, 0)
+			if err := ec.InitializeAnchors(1000, target, 0); err != nil {
+				t.Fatal(err)
+			}
 			q := &defaultSourceQuerier{estClock: ec, leapHistory: lh}
-			got, err := q.localUnixEstimate(1000)
+			got, _, err := q.localUnixEstimate(1000)
 			if tc.leap {
 				if err == nil {
 					t.Fatal("ambiguous leap accepted")
 				}
 				return
 			}
-			if err != nil || got != time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano() {
-				t.Fatalf("got %d, %v", got, err)
+			if err != nil || got != tc.wantUnix {
+				t.Fatalf("local Unix estimate = %d, %v; want %d", got, err, tc.wantUnix)
 			}
 		})
 	}
 	for _, ec := range []*clock.EstimateClock{nil, clock.NewEstimateClock()} {
 		q := &defaultSourceQuerier{estClock: ec, leapHistory: lh}
 		before := time.Now().UnixNano()
-		got, err := q.localUnixEstimate(0)
+		got, _, err := q.localUnixEstimate(0)
 		after := time.Now().UnixNano()
 		if err != nil || got < before || got > after {
 			t.Fatalf("fallback outside wall-clock bracket: %d %v", got, err)

@@ -39,7 +39,7 @@ type SmearPlan struct {
 // EvaluateBiasAt calculates smear bias in nanoseconds at raw instant r.
 func (sp *SmearPlan) EvaluateBiasAt(r core.RawNanos) core.PhaseNs {
 	if len(sp.Segments) == 0 {
-		return 0
+		return sp.TerminalBiasNs
 	}
 
 	for i := range sp.Segments {
@@ -203,8 +203,14 @@ type PublicClock struct {
 // NewPublicClock creates a new PublicClock instance.
 func NewPublicClock() *PublicClock {
 	pc := &PublicClock{}
+	pc.lastPublic.Store(math.MinInt64)
 	pc.smearPlan.Store(&SmearPlan{})
 	return pc
+}
+
+// LastPublicInstant returns the preserved presentation center without advancing it.
+func (pc *PublicClock) LastPublicInstant() core.GstInstant {
+	return core.GstInstant(pc.lastPublic.Load())
 }
 
 // SetSmearPlan updates the active smear plan.
@@ -213,26 +219,30 @@ func (pc *PublicClock) SetSmearPlan(plan *SmearPlan) {
 }
 
 // ReadPublicInstant evaluates the public clock with atomic-max monotonic clamp (Section 7.15).
-func (pc *PublicClock) ReadPublicInstant(estimate core.GstInstant, raw core.RawNanos) (publicVal core.GstInstant, clampDebt core.PhaseNs) {
+// Arithmetic failure preserves the previous public value and returns it with an error.
+func (pc *PublicClock) ReadPublicInstant(estimate core.GstInstant, raw core.RawNanos) (publicVal core.GstInstant, clampDebt core.PhaseNs, err error) {
 	plan := pc.smearPlan.Load()
 	var smearBias core.PhaseNs
 	if plan != nil {
 		smearBias = plan.EvaluateBiasAt(raw)
 	}
 
-	unclamped := estimate + core.GstInstant(smearBias)
+	unclamped, err := core.CheckedInstantAdd(estimate, int64(smearBias))
+	if err != nil {
+		return core.GstInstant(pc.lastPublic.Load()), 0, err
+	}
 	candidate := int64(unclamped)
-
 	for {
 		old := pc.lastPublic.Load()
-		returned := candidate
-		if old > returned {
-			returned = old
+		if old >= candidate {
+			debt := uint64(old) - uint64(candidate)
+			if debt > math.MaxInt64 {
+				return core.GstInstant(old), 0, core.ErrOverflow
+			}
+			return core.GstInstant(old), core.PhaseNs(debt), nil
 		}
-
-		if pc.lastPublic.CompareAndSwap(old, returned) {
-			debt := returned - candidate
-			return core.GstInstant(returned), core.PhaseNs(debt)
+		if pc.lastPublic.CompareAndSwap(old, candidate) {
+			return unclamped, 0, nil
 		}
 	}
 }
@@ -247,9 +257,5 @@ func ComputePublicSymmetricEpsilon(
 		return core.ErrorInfinity
 	}
 
-	d1 := math.Abs(float64(p - interval.Earliest))
-	d2 := math.Abs(float64(interval.Latest - p))
-	maxDist := math.Max(d1, d2)
-
-	return core.ErrorNs(maxDist) + readBound
+	return core.SymmetricEpsilon(p, *interval, readBound)
 }

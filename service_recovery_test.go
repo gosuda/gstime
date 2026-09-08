@@ -9,10 +9,12 @@ import (
 )
 
 func TestHoldoverLimitAndExplicitInvalidation(t *testing.T) {
-	raw, svc := regressionAnchoredService(t)
 	cfg := config.DefaultConfig()
 	cfg.Assurance.MaxHoldoverAgeNs = 1_000_000_000
-	cfg.Sources = []config.SourceConfig{{FaultDomainID: "a"}, {FaultDomainID: "b"}, {FaultDomainID: "c"}}
+	cfg.Sources = []config.SourceConfig{
+		{FaultDomainID: "a", Endpoint: "a"}, {FaultDomainID: "b", Endpoint: "b"}, {FaultDomainID: "c", Endpoint: "c"},
+	}
+	raw, svc := regressionAnchoredService(t, cfg)
 	engine, err := gstime.NewSyncEngine(cfg, svc, gstime.WithSourceQuerier(regressionUnavailableQuerier{}))
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +55,7 @@ func TestHoldoverLimitAndExplicitInvalidation(t *testing.T) {
 }
 
 func TestConcurrentServicePublication(t *testing.T) {
-	raw, svc := regressionAnchoredService(t)
+	raw, svc := regressionAnchoredService(t, config.DefaultConfig())
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {

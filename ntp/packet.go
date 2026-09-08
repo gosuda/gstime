@@ -13,8 +13,9 @@ const (
 )
 
 var (
-	ErrPacketTooShort = errors.New("ntp packet is smaller than 48 bytes")
-	ErrEraAmbiguous   = errors.New("ntp era unfolding ambiguous: zero or multiple candidates")
+	ErrPacketTooShort   = errors.New("ntp packet is smaller than 48 bytes")
+	ErrEraAmbiguous     = errors.New("ntp era unfolding ambiguous: zero or multiple candidates")
+	errUnknownTimestamp = errors.New("zero timestamp represents unknown/unsynchronized")
 )
 
 // Packet represents a parsed NTPv4 packet.
@@ -101,14 +102,18 @@ func (p *Packet) RootDispersionSeconds() float64 {
 	return float64(p.RootDisp) / 65536.0
 }
 
-// RootDelayNanoseconds converts root delay to nanoseconds.
+// RootDelayNanoseconds rounds outward, preserving the sign of invalid negative delays.
 func (p *Packet) RootDelayNanoseconds() int64 {
-	return int64(float64(p.RootDelay) * 1_000_000_000.0 / 65536.0)
+	product := int64(p.RootDelay) * 1_000_000_000 // Signed 32-bit input fits in int64.
+	if product < 0 {
+		return -((-product + 65535) / 65536)
+	}
+	return (product + 65535) / 65536
 }
 
-// RootDispersionNanoseconds converts root dispersion to nanoseconds.
+// RootDispersionNanoseconds rounds uncertainty toward positive infinity.
 func (p *Packet) RootDispersionNanoseconds() int64 {
-	return int64(float64(p.RootDisp) * 1_000_000_000.0 / 65536.0)
+	return (int64(p.RootDisp)*1_000_000_000 + 65535) / 65536
 }
 
 // DecodeTimestampRaw extracts seconds and fraction from an 8-byte NTP timestamp.
@@ -184,7 +189,7 @@ func NtpFractionToNanosCeil(frac uint32) int64 {
 func UnfoldTimestamp(raw [8]byte, coarseUnixSec int64) (int64, error) {
 	sec32, frac32 := DecodeTimestampRaw(raw)
 	if sec32 == 0 && frac32 == 0 {
-		return 0, errors.New("zero timestamp represents unknown/unsynchronized")
+		return 0, errUnknownTimestamp
 	}
 
 	unfoldedNtp, err := UnfoldNtpSeconds(sec32, coarseUnixSec)

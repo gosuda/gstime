@@ -3,6 +3,8 @@ package ntp
 import (
 	"bytes"
 	"testing"
+
+	"gosuda.org/gstime/core"
 )
 
 func TestPacketEncodeDecode(t *testing.T) {
@@ -95,6 +97,8 @@ func TestNegativeRawDelayClampedToPrecisionFloor(t *testing.T) {
 		T4LocalRecvEstimate: 110,
 		LocalSendRaw:        1000,
 		LocalRecvRaw:        1100,
+		RawScaleLower:       core.RateScale(core.OneQ48),
+		RawScaleUpper:       core.RateScale(core.OneQ48),
 		LocalEstimateAtMid:  105,
 		PrecisionFloorNs:    10, // precision floor 10ns
 	}

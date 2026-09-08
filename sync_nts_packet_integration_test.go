@@ -120,8 +120,13 @@ func testNTSEndToEndNegotiatedPort(t *testing.T, cookieSize int) {
 			serverErrors <- fmt.Errorf("RFC client authentication: %w", err)
 			return
 		}
+		request, err := ntp.ParsePacket(buf[:n])
+		if err != nil {
+			serverErrors <- err
+			return
+		}
 		stamp := ntp.EncodeTimestamp(uint32(unixSeconds+ntp.NtpToUnixOffset), 0)
-		header := (&ntp.Packet{Version: 4, Mode: 4, Stratum: 1, RecvTimestamp: stamp, TxTimestamp: stamp}).Encode()
+		header := (&ntp.Packet{Version: 4, Mode: 4, Stratum: 1, OrigTimestamp: request.TxTimestamp, RecvTimestamp: stamp, TxTimestamp: stamp}).Encode()
 		pre := ntp.EncodeExtensionFields([]ntp.ExtensionField{{Type: nts.ExtTypeUniqueID, Value: fields[0].Value}})
 		ad := append(append([]byte{}, header...), pre...)
 		nonce := bytes.Repeat([]byte{9}, s2c.NonceSize()) // single response under this ephemeral key

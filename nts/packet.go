@@ -25,6 +25,12 @@ var (
 	ErrMissingAuthenticator = errors.New("nts response missing authenticator field")
 	ErrAuthNotLast          = errors.New("nts authenticator is not the last extension field")
 	ErrCookieStarvation     = errors.New("no unused cookies available for request")
+	errNTPHeaderSize        = errors.New("NTS requires a 48-byte NTP header")
+	errAuthWireTooShort     = errors.New("authenticator wire too short")
+	errAuthWireLengths      = errors.New("authenticator wire shorter than declared nonce and ciphertext")
+	errAuthNonceSize        = errors.New("unsupported NTS wire nonce length")
+	errAuthCiphertextSize   = errors.New("NTS authenticator ciphertext shorter than authentication tag")
+	errEncryptedTrailing    = errors.New("trailing bytes in encrypted NTS extension fields")
 )
 
 // AuthenticatorField decodes the contents of an RFC 8915 Authenticator extension field.
@@ -46,7 +52,7 @@ func BuildProtectedRequest(
 	c2sKey []byte,
 ) (extBytes []byte, uniqueID []byte, err error) {
 	if len(ntpHeader) != 48 {
-		return nil, nil, errors.New("NTS requires a 48-byte NTP header")
+		return nil, nil, errNTPHeaderSize
 	}
 	placeholderCount, err = requestPlaceholderCount(len(cookie), placeholderCount, aead)
 	if err != nil {
@@ -135,6 +141,9 @@ func VerifyAndDecryptResponse(
 	if err := checkResponsePacketSize(ntpHeader, extFields); err != nil {
 		return nil, err
 	}
+	if aead == nil {
+		return nil, errMissingAEAD
+	}
 	if len(extFields) == 0 {
 		return nil, ErrMissingAuthenticator
 	}
@@ -165,18 +174,27 @@ func VerifyAndDecryptResponse(
 	// 3. Parse Authenticator field
 	authWire := lastField.Wire
 	if len(authWire) < 12 { // 4-byte header + 2 noncelen + 2 cipherlen + ...
-		return nil, errors.New("authenticator wire too short")
+		return nil, errAuthWireTooShort
 	}
 
 	nonceLen := int(binary.BigEndian.Uint16(authWire[4:6]))
 	cipherLen := int(binary.BigEndian.Uint16(authWire[6:8]))
 
-	if len(authWire) < 8+nonceLen+cipherLen {
-		return nil, errors.New("authenticator wire shorter than declared nonce and ciphertext")
+	// The registered NTS profile uses fixed 16-byte (15) and 12-byte (30) nonces.
+	if nonceLen != aead.NonceSize() {
+		return nil, errAuthNonceSize
+	}
+	if aead.Overhead() <= 0 || cipherLen < aead.Overhead() {
+		return nil, errAuthCiphertextSize
+	}
+	// RFC 8915 section 5.6 pads the nonce and ciphertext independently.
+	cipherOffset := 8 + paddedLength(nonceLen)
+	if len(authWire) < cipherOffset+paddedLength(cipherLen) {
+		return nil, errAuthWireLengths
 	}
 
 	nonce := authWire[8 : 8+nonceLen]
-	ciphertext := authWire[8+nonceLen : 8+nonceLen+cipherLen]
+	ciphertext := authWire[cipherOffset : cipherOffset+cipherLen]
 
 	// 4. Construct Associated Data:
 	// RFC 8915 section 5.6: NTP header || extension fields BEFORE Authenticator.
@@ -199,7 +217,7 @@ func VerifyAndDecryptResponse(
 			return nil, fmt.Errorf("malformed encrypted NTS extension fields: %w", err)
 		}
 		if len(trailing) != 0 {
-			return nil, errors.New("trailing bytes in encrypted NTS extension fields")
+			return nil, errEncryptedTrailing
 		}
 		for _, inF := range innerFields {
 			if inF.Type == ExtTypeCookie {

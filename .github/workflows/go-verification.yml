@@ -36,6 +36,8 @@ jobs:
         run: go test -race -tags integration -shuffle=on -count=1 ./...
       - name: NTS-KE parser fuzz smoke
         run: go test ./nts -run '^$' -fuzz '^FuzzReadServerResponse$' -fuzztime=5s -parallel=2
+      - name: NTS response parser fuzz smoke
+        run: go test ./nts -run '^$' -fuzz '^FuzzVerifyAndDecryptResponse$' -fuzztime=5s -parallel=2
 
   quality:
     name: Static checks and vulnerabilities

@@ -17,6 +17,20 @@ const (
 	MaxKERecordSize  = 65535
 )
 
+var (
+	errKEEndOfMessage      = errors.New("invalid NTS-KE End of Message record")
+	errKEMissingSelection  = errors.New("NTS-KE response missing protocol, AEAD, or cookies")
+	errKEProtocolSelection = errors.New("NTS-KE must select NTPv4 exactly once")
+	errKEAEADSelection     = errors.New("NTS-KE must select one AEAD exactly once")
+	errKEWarning           = errors.New("invalid NTS-KE Warning record")
+	errKEDuplicateServer   = errors.New("duplicate NTP server negotiation")
+	errKEPort              = errors.New("invalid NTP port negotiation")
+	errKEExporter          = errors.New("invalid compliant exporter marker")
+	errKEServerName        = errors.New("invalid NTP server name")
+	errKEServerLabel       = errors.New("invalid NTP server label")
+	errKEServerASCII       = errors.New("NTP server name must be an ASCII FQDN or IP address")
+)
+
 // KeyExchangeResponse contains a fully validated NTPv4 NTS-KE response.
 // Empty ServerName means the TLS peer's IP address, not a fresh DNS resolution.
 type KeyExchangeResponse struct {
@@ -56,20 +70,20 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 		switch kind {
 		case RecordEndOfMessage:
 			if !critical || size != 0 {
-				return nil, errors.New("invalid NTS-KE End of Message record")
+				return nil, errKEEndOfMessage
 			}
 			if !seen[RecordNextProtocol] || !seen[RecordAeadNegotiation] || len(response.Cookies) == 0 {
-				return nil, errors.New("NTS-KE response missing protocol, AEAD, or cookies")
+				return nil, errKEMissingSelection
 			}
 			return response, nil
 		case RecordNextProtocol:
 			if seen[kind] || !critical || size != 2 || binary.BigEndian.Uint16(body) != 0 {
-				return nil, errors.New("NTS-KE must select NTPv4 exactly once")
+				return nil, errKEProtocolSelection
 			}
 			seen[kind] = true
 		case RecordAeadNegotiation:
 			if seen[kind] || size != 2 {
-				return nil, errors.New("NTS-KE must select one AEAD exactly once")
+				return nil, errKEAEADSelection
 			}
 			seen[kind] = true
 			id := binary.BigEndian.Uint16(body)
@@ -92,14 +106,14 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 			return nil, ErrNtsKeFailed
 		case RecordWarning:
 			if !critical || size != 2 {
-				return nil, errors.New("invalid NTS-KE Warning record")
+				return nil, errKEWarning
 			}
 			// RFC 8915 section 4.1.4 defines no warning codes and requires
 			// unrecognized codes to be treated as errors.
 			return nil, ErrWarningEncountered
 		case RecordServerNegotiation:
 			if seen[kind] {
-				return nil, errors.New("duplicate NTP server negotiation")
+				return nil, errKEDuplicateServer
 			}
 			seen[kind] = true
 			name, err := serverName(body)
@@ -109,13 +123,13 @@ func ReadServerResponse(r io.Reader, offered []uint16) (*KeyExchangeResponse, er
 			response.ServerName = name
 		case RecordPortNegotiation:
 			if seen[kind] || size != 2 || binary.BigEndian.Uint16(body) == 0 {
-				return nil, errors.New("invalid NTP port negotiation")
+				return nil, errKEPort
 			}
 			seen[kind] = true
 			response.Port = binary.BigEndian.Uint16(body)
 		case RecordCompliantExporter:
 			if seen[kind] || size != 0 {
-				return nil, errors.New("invalid compliant exporter marker")
+				return nil, errKEExporter
 			}
 			seen[kind] = true
 		default:
@@ -133,15 +147,15 @@ func serverName(body []byte) (string, error) {
 	}
 	name = strings.TrimSuffix(name, ".")
 	if len(name) == 0 || len(name) > 253 {
-		return "", errors.New("invalid NTP server name")
+		return "", errKEServerName
 	}
 	for _, label := range strings.Split(name, ".") {
 		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", errors.New("invalid NTP server label")
+			return "", errKEServerLabel
 		}
 		for _, c := range []byte(label) {
 			if !isValidDomainChar(c) {
-				return "", errors.New("NTP server name must be an ASCII FQDN or IP address")
+				return "", errKEServerASCII
 			}
 		}
 	}

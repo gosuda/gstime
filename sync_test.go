@@ -60,7 +60,6 @@ func TestSyncEngine_LifecycleAndZeroGoroutineLeak(t *testing.T) {
 
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
 	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
 
 	cfg := config.DefaultConfig()
 	cfg.Sources = []config.SourceConfig{
@@ -69,7 +68,11 @@ func TestSyncEngine_LifecycleAndZeroGoroutineLeak(t *testing.T) {
 		{FaultDomainID: "d3", Endpoint: "10.0.0.3:123", NTS: false},
 	}
 
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
 	mock := &mockQuerier{
@@ -155,7 +158,6 @@ func TestSyncEngine_LifecycleAndZeroGoroutineLeak(t *testing.T) {
 func TestSyncEngine_PollOnceConsensus(t *testing.T) {
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
 	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
 
 	cfg := config.DefaultConfig()
 	cfg.Assurance.FaultBudget = 1
@@ -168,7 +170,11 @@ func TestSyncEngine_PollOnceConsensus(t *testing.T) {
 		{FaultDomainID: "d4", Endpoint: "10.0.0.4:123", NTS: false}, // Byzantine faulty
 	}
 
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
 	byzantineTime := targetTime + gstime.GstInstant(3600*1_000_000_000) // 1 hour ahead
@@ -208,7 +214,6 @@ func TestSyncEngine_PollOnceConsensus(t *testing.T) {
 func TestSyncEngine_InsufficientDomains(t *testing.T) {
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
 	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
 
 	cfg := config.DefaultConfig()
 	cfg.Assurance.MinVotingDomains = 3
@@ -217,7 +222,11 @@ func TestSyncEngine_InsufficientDomains(t *testing.T) {
 		{FaultDomainID: "d2", Endpoint: "10.0.0.2:123", NTS: false},
 	}
 
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 	mock := &mockQuerier{
 		results: map[string]*ntp.MeasurementResult{
 			"10.0.0.1:123": newMockMeasurement(1_000_000, 10_000, 10_000_000_000),
@@ -262,12 +271,18 @@ func TestSyncEngine_RealLoopbackUDP(t *testing.T) {
 					return // Server closed
 				}
 				if n >= 48 {
+					req, err := ntp.ParsePacket(buf[:n])
+					if err != nil {
+						t.Error(err)
+						return
+					}
 					// Build dummy Stratum 1 response
 					resp := ntp.Packet{
-						Version: 4,
-						Mode:    4, // Server
-						Stratum: 1,
-						Poll:    6,
+						Version:       4,
+						Mode:          4, // Server
+						Stratum:       1,
+						Poll:          6,
+						OrigTimestamp: req.TxTimestamp,
 					}
 					// Put dummy valid timestamps
 					sec := uint32(time.Now().Unix() + 2208988800) // NTP epoch
@@ -287,7 +302,6 @@ func TestSyncEngine_RealLoopbackUDP(t *testing.T) {
 
 	raw := clock.NewSystemRawClock()
 	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
 
 	cfg := config.DefaultConfig()
 	cfg.Assurance.MinVotingDomains = 3
@@ -298,7 +312,11 @@ func TestSyncEngine_RealLoopbackUDP(t *testing.T) {
 		{FaultDomainID: "loopback-3", Endpoint: endpoints[2], NTS: false},
 	}
 
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	// Use default network querier (testing real UDP network socket I/O)
 	engine, err := gstime.NewSyncEngine(
@@ -327,7 +345,6 @@ func TestSyncEngine_RealLoopbackUDP(t *testing.T) {
 func TestSyncEngine_WaitSync(t *testing.T) {
 	raw := clock.NewSimulatedRawClock(10_000_000_000)
 	lh, _ := core.NewLeapHistory(10, nil)
-	var cfgID [32]byte
 
 	cfg := config.DefaultConfig()
 	cfg.Sources = []config.SourceConfig{
@@ -336,7 +353,11 @@ func TestSyncEngine_WaitSync(t *testing.T) {
 		{FaultDomainID: "d3", Endpoint: "10.0.0.3:123", NTS: false},
 	}
 
-	svc := gstime.NewClockService(raw, lh, cfgID, 32_000_000_000)
+	cfgID, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := gstime.NewClockService(raw, lh, cfgID, cfg.Assurance.MaxWidthNs)
 
 	targetTime := gstime.GstInstant(1_700_000_000 * 1_000_000_000)
 	mock := &mockQuerier{

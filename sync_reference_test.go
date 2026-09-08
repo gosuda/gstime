@@ -91,7 +91,10 @@ func TestPollRejectsCachedSampleFromBeforeRound(t *testing.T) {
 	lh, _ := core.NewLeapHistory(10, nil)
 	cfg := config.DefaultConfig()
 	cfg.Sources = []config.SourceConfig{{FaultDomainID: "a", Endpoint: "a"}, {FaultDomainID: "b", Endpoint: "b"}, {FaultDomainID: "c", Endpoint: "c"}}
-	id, _ := cfg.ConfigID()
+	id, err := cfg.ConfigID()
+	if err != nil {
+		t.Fatal(err)
+	}
 	svc := gstime.NewClockService(raw, lh, id, cfg.Assurance.MaxWidthNs)
 	q := &regressionReferenceQuerier{raw: raw, measurements: map[string]*ntp.MeasurementResult{}}
 	for _, src := range cfg.Sources {
